@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,12 +12,29 @@ from app.core.config import Settings, get_settings
 from app.core.database import Database
 from app.core.seed import seed_database
 from app.services.docker import DockerService
+from app.services.reaper import run_reaper
 
-VERSION = "Alpha0.0.1"
+VERSION = "Alpha0.0.2"
+logger = logging.getLogger("syclover")
+
+
+def configure_logging() -> None:
+    """Make platform logs visible even when the host app configures no logging.
+
+    Uvicorn installs handlers for its own loggers only; without this the module-level
+    loggers fall back to a handler-less root logger and every line is dropped.
+    """
+    if logging.getLogger().handlers:
+        return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or get_settings()
+    configure_logging()
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -26,7 +45,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         application.state.settings = resolved_settings
         application.state.database = database
         application.state.docker = DockerService(resolved_settings.docker_mode)
-        yield
+        reaper_task: asyncio.Task | None = None
+        if resolved_settings.instance_reaper_enabled:
+            reaper_task = asyncio.create_task(
+                run_reaper(database, application.state.docker, resolved_settings),
+                name="instance-reaper",
+            )
+            logger.info(
+                "Instance reaper started: TTL %s minute(s), sweep every %s second(s)",
+                resolved_settings.instance_ttl_minutes,
+                resolved_settings.instance_reaper_interval_seconds,
+            )
+        else:
+            logger.info("Instance reaper is disabled by configuration")
+        try:
+            yield
+        finally:
+            if reaper_task is not None:
+                reaper_task.cancel()
+                try:
+                    await reaper_task
+                except asyncio.CancelledError:
+                    pass
 
     application = FastAPI(
         title=resolved_settings.app_name,

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Iterator
 
@@ -28,6 +30,10 @@ CREATE TABLE IF NOT EXISTS challenges (
     points INTEGER NOT NULL CHECK (points > 0),
     docker_image TEXT,
     internal_port INTEGER,
+    build_status TEXT NOT NULL DEFAULT 'none' CHECK (build_status IN ('none', 'building', 'success', 'failed')),
+    build_output TEXT,
+    detected_port INTEGER,
+    flag_template TEXT,
     flag_digest TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'archived')),
     created_at TEXT NOT NULL,
@@ -42,6 +48,7 @@ CREATE TABLE IF NOT EXISTS instances (
     container_name TEXT NOT NULL,
     public_host TEXT,
     public_port INTEGER,
+    instance_flag TEXT,
     status TEXT NOT NULL CHECK (status IN ('starting', 'running', 'stopped', 'failed')),
     error_message TEXT,
     expires_at TEXT NOT NULL,
@@ -66,7 +73,7 @@ CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY,
     challenge_id TEXT NOT NULL REFERENCES challenges(id),
     user_id TEXT REFERENCES users(id),
-    kind TEXT NOT NULL CHECK (kind IN ('attachment', 'patch', 'check_script', 'fix_script')),
+    kind TEXT NOT NULL CHECK (kind IN ('attachment', 'build_archive', 'patch', 'check_script', 'fix_script')),
     original_name TEXT NOT NULL,
     stored_name TEXT NOT NULL UNIQUE,
     size_bytes INTEGER NOT NULL,
@@ -84,7 +91,59 @@ CREATE TABLE IF NOT EXISTS deployment_events (
     output TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS defense_solves (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    challenge_id TEXT NOT NULL REFERENCES challenges(id),
+    event_id TEXT NOT NULL UNIQUE REFERENCES deployment_events(id),
+    created_at TEXT NOT NULL,
+    UNIQUE(user_id, challenge_id)
+);
+
+CREATE TABLE IF NOT EXISTS hints (
+    id TEXT PRIMARY KEY,
+    challenge_id TEXT NOT NULL REFERENCES challenges(id),
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    kind TEXT NOT NULL DEFAULT 'topic' CHECK (kind IN ('topic', 'state')),
+    description TEXT,
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS challenge_tags (
+    challenge_id TEXT NOT NULL REFERENCES challenges(id),
+    tag_id TEXT NOT NULL REFERENCES tags(id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (challenge_id, tag_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_submissions_challenge_correct_created
+ON submissions(challenge_id, correct, created_at);
+CREATE INDEX IF NOT EXISTS idx_defense_solves_challenge_created
+ON defense_solves(challenge_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_hints_challenge_status_created
+ON hints(challenge_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_challenge_tags_tag ON challenge_tags(tag_id);
 """
+
+# Knowledge-point tags seeded on first start; administrators may rename or remove them.
+DEFAULT_TAGS = (
+    ("web", "topic", "Web 方向知识点", 10),
+    ("pwn", "topic", "二进制利用", 20),
+    ("reverse", "topic", "逆向工程", 30),
+    ("crypto", "topic", "密码学", 40),
+    ("misc", "topic", "杂项与综合", 50),
+)
 
 
 class Database:
@@ -96,6 +155,17 @@ class Database:
         self._migrate_legacy_constraints()
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+        self._seed_tags()
+
+    def _seed_tags(self) -> None:
+        """Insert the default knowledge-point tags once, without touching later edits."""
+        with self.connect() as connection:
+            for name, kind, description, order in DEFAULT_TAGS:
+                connection.execute(
+                    "INSERT OR IGNORE INTO tags (id, name, kind, description, sort_order, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), name, kind, description, order, datetime.now(UTC).isoformat()),
+                )
 
     def _migrate_legacy_constraints(self) -> None:
         """Rebuild constrained SQLite tables introduced before Alpha0.0.1."""
@@ -114,11 +184,18 @@ class Database:
                         mode TEXT NOT NULL CHECK (mode IN ('ctf', 'awdp')),
                         difficulty TEXT NOT NULL CHECK (difficulty IN ('noob', 'easy', 'normal', 'hard', 'insane')),
                         points INTEGER NOT NULL CHECK (points > 0), docker_image TEXT,
-                        internal_port INTEGER, flag_digest TEXT NOT NULL,
+                        internal_port INTEGER,
+                        build_status TEXT NOT NULL DEFAULT 'none'
+                            CHECK (build_status IN ('none', 'building', 'success', 'failed')),
+                        build_output TEXT, detected_port INTEGER,
+                        flag_template TEXT, flag_digest TEXT NOT NULL,
                         status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'archived')),
                         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                     );
-                    INSERT INTO challenges_v2
+                    INSERT INTO challenges_v2 (
+                        id, title, slug, description, category, mode, difficulty, points,
+                        docker_image, internal_port, flag_digest, status, created_at, updated_at
+                    )
                     SELECT id, title, slug, description, category, mode,
                            CASE difficulty WHEN 'medium' THEN 'normal' ELSE difficulty END,
                            points, docker_image, internal_port, flag_digest, status, created_at, updated_at
@@ -131,14 +208,14 @@ class Database:
             asset_sql = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'assets'"
             ).fetchone()
-            if asset_sql and "'check_script'" not in asset_sql[0]:
+            if asset_sql and "'build_archive'" not in asset_sql[0]:
                 connection.executescript(
                     """
                     CREATE TABLE assets_v2 (
                         id TEXT PRIMARY KEY,
                         challenge_id TEXT NOT NULL REFERENCES challenges(id),
                         user_id TEXT REFERENCES users(id),
-                        kind TEXT NOT NULL CHECK (kind IN ('attachment', 'patch', 'check_script', 'fix_script')),
+                        kind TEXT NOT NULL CHECK (kind IN ('attachment', 'build_archive', 'patch', 'check_script', 'fix_script')),
                         original_name TEXT NOT NULL, stored_name TEXT NOT NULL UNIQUE,
                         size_bytes INTEGER NOT NULL,
                         validation_status TEXT NOT NULL DEFAULT 'pending'
@@ -150,6 +227,24 @@ class Database:
                     ALTER TABLE assets_v2 RENAME TO assets;
                     """
                 )
+            challenge_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(challenges)").fetchall()
+            }
+            if challenge_columns and "build_status" not in challenge_columns:
+                connection.execute(
+                    "ALTER TABLE challenges ADD COLUMN build_status TEXT NOT NULL DEFAULT 'none'"
+                )
+            if challenge_columns and "build_output" not in challenge_columns:
+                connection.execute("ALTER TABLE challenges ADD COLUMN build_output TEXT")
+            if challenge_columns and "flag_template" not in challenge_columns:
+                connection.execute("ALTER TABLE challenges ADD COLUMN flag_template TEXT")
+            if challenge_columns and "detected_port" not in challenge_columns:
+                connection.execute("ALTER TABLE challenges ADD COLUMN detected_port INTEGER")
+            instance_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(instances)").fetchall()
+            }
+            if instance_columns and "instance_flag" not in instance_columns:
+                connection.execute("ALTER TABLE instances ADD COLUMN instance_flag TEXT")
             connection.commit()
         finally:
             connection.close()

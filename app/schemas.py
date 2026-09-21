@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.services.flags import PLACEHOLDER
 
 CTF_CATEGORIES = ("Web", "Pwn", "Reverse", "Misc", "Crypto")
 AWDP_CATEGORIES = ("Web", "Pwn")
@@ -58,6 +60,7 @@ class ChallengeCreate(BaseModel):
     docker_image: str | None = Field(default=None, max_length=255)
     internal_port: int | None = Field(default=None, ge=1, le=65535)
     flag: str = Field(min_length=3, max_length=512)
+    tags: list[str] = Field(default_factory=list, max_length=20)
     status: Literal["draft", "published", "archived"] = "draft"
 
     @field_validator("docker_image")
@@ -82,20 +85,84 @@ class ChallengeUpdate(BaseModel):
     docker_image: str | None = Field(default=None, max_length=255)
     internal_port: int | None = Field(default=None, ge=1, le=65535)
     flag: str | None = Field(default=None, min_length=3, max_length=512)
+    tags: list[str] | None = Field(default=None, max_length=20)
     status: Literal["draft", "published", "archived"] | None = None
+
+
+class TagPublic(BaseModel):
+    id: str
+    name: str
+    kind: Literal["topic", "state"]
+    description: str | None = None
+    challenge_count: int = 0
+
+
+class TagUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=32)
+    description: str | None = Field(default=None, max_length=200)
 
 
 class AssetPublic(BaseModel):
     id: str
     challenge_id: str
     user_id: str | None
-    kind: Literal["attachment", "patch", "check_script", "fix_script"]
+    kind: Literal["attachment", "build_archive", "patch", "check_script", "fix_script"]
     original_name: str
     size_bytes: int
     validation_status: Literal["pending", "valid", "invalid"]
     validation_output: str | None
     created_at: datetime
     download_url: str
+
+
+class BloodEntry(BaseModel):
+    rank: int
+    user_id: str
+    username: str
+    solved_at: datetime
+
+
+class HintPublic(BaseModel):
+    id: str
+    challenge_id: str
+    title: str
+    content: str
+    status: Literal["draft", "published"]
+    created_at: datetime
+    updated_at: datetime
+
+
+class HintCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
+    content: str = Field(min_length=1, max_length=20_000)
+    status: Literal["draft", "published"] = "draft"
+
+
+class HintUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=100)
+    content: str | None = Field(default=None, min_length=1, max_length=20_000)
+    status: Literal["draft", "published"] | None = None
+
+
+class BuildResult(BaseModel):
+    challenge_id: str
+    image: str
+    status: Literal["success", "failed"]
+    output: str
+    internal_port: int | None
+    detected_port: int | None = None
+    port_warning: str | None = None
+
+
+class BuildProgress(BaseModel):
+    challenge_id: str
+    status: Literal["none", "building", "success", "failed"]
+    data: str = ""
+    cursor: int = 0
+    finished: bool = False
+    truncated: bool = False
+    percent: int = 0
+    port_warning: str | None = None
 
 
 class ChallengePublic(BaseModel):
@@ -109,11 +176,21 @@ class ChallengePublic(BaseModel):
     points: int
     docker_image: str | None
     internal_port: int | None
+    build_status: Literal["none", "building", "success", "failed"] = "none"
+    detected_port: int | None = None
     status: Literal["draft", "published", "archived"]
+    flag_template: str | None = None
+    tags: list[str] = Field(default_factory=list)
     solved: bool = False
     attachments: list[AssetPublic] = Field(default_factory=list)
     check_script_configured: bool = False
     fix_script_configured: bool = False
+    solves: int = 0
+    bloods: list[BloodEntry] = Field(default_factory=list)
+    attack_solves: int = 0
+    defense_solves: int = 0
+    attack_bloods: list[BloodEntry] = Field(default_factory=list)
+    defense_bloods: list[BloodEntry] = Field(default_factory=list)
 
 
 class InstancePublic(BaseModel):
@@ -122,10 +199,39 @@ class InstancePublic(BaseModel):
     challenge_title: str | None = None
     public_host: str | None
     public_port: int | None
+    instance_flag: str | None = None
     status: Literal["starting", "running", "stopped", "failed"]
     error_message: str | None
     expires_at: datetime
     created_at: datetime
+
+    @model_validator(mode="after")
+    def add_access_hints(self):
+        """Give the browser everything it needs to reach the instance.
+
+        Web-style challenges are opened over HTTP; everything else is a raw TCP
+        service, so the UI shows a ready-to-paste ``nc`` command instead.
+        """
+        if self.public_host and self.public_port:
+            host = f"[{self.public_host}]" if ":" in self.public_host else self.public_host
+            self.connect_command = f"nc {host} {self.public_port}"
+            self.access_url = f"http://{host}:{self.public_port}"
+            self.listen_address = f"{host}:{self.public_port}"
+        return self
+
+    connect_command: str | None = None
+    access_url: str | None = None
+    listen_address: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def hide_other_players_flag(cls, value: Any) -> Any:
+        """The owning solution may read its instance flag; nobody else may."""
+        if isinstance(value, dict) and not value.get("mine", True):
+            data = dict(value)
+            data["instance_flag"] = None
+            return data
+        return value
 
 
 class SubmissionRequest(BaseModel):

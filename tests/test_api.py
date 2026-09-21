@@ -1,3 +1,6 @@
+import io
+from zipfile import ZipFile
+
 from tests.conftest import auth_header
 
 
@@ -37,6 +40,25 @@ def test_flag_submission_awards_only_once_and_updates_scoreboard(client, player_
     assert ranking["solves"] == 1
     assert client.get("/api/v1/scoreboard?mode=ctf", headers=player_headers).json()["rankings"][0]["score"] == 100
     assert client.get("/api/v1/scoreboard?mode=awdp", headers=player_headers).json()["rankings"][0]["score"] == 0
+    detail = client.get(f"/api/v1/challenges/{challenge['id']}", headers=player_headers).json()
+    assert detail["solves"] == 1
+    assert detail["bloods"][0]["username"] == "player"
+    assert detail["bloods"][0]["rank"] == 1
+    for username in ("second", "third", "fourth"):
+        headers = auth_header(client, username, f"{username.title()}Pass123!")
+        solved = client.post(
+            f"/api/v1/challenges/{challenge['id']}/submit",
+            headers=headers,
+            json={"flag": "SYC{welcome_to_training_garden}"},
+        )
+        assert solved.json()["correct"] is True
+    detail = client.get(f"/api/v1/challenges/{challenge['id']}", headers=player_headers).json()
+    assert detail["solves"] == 4
+    assert [(entry["rank"], entry["username"]) for entry in detail["bloods"]] == [
+        (1, "player"),
+        (2, "second"),
+        (3, "third"),
+    ]
 
 
 def test_mock_instance_lifecycle(client, player_headers):
@@ -80,7 +102,7 @@ def test_admin_challenge_and_attachment(client, admin_headers, player_headers):
     assert download.content == b"training notes"
 
 
-def test_awdp_asset_validation_deploy_and_ownership(client, player_headers):
+def test_awdp_asset_validation_deploy_and_ownership(client, player_headers, admin_headers):
     challenge = next(
         item for item in client.get("/api/v1/challenges?mode=awdp", headers=player_headers).json()
         if item["slug"] == "service-under-fire"
@@ -99,8 +121,26 @@ def test_awdp_asset_validation_deploy_and_ownership(client, player_headers):
     )
     assert event.status_code == 200
     assert event.json()["success"] is True
+    defense_detail = client.get(
+        f"/api/v1/challenges/{challenge['id']}", headers=player_headers
+    ).json()
+    assert defense_detail["defense_solves"] == 1
+    assert defense_detail["attack_solves"] == 0
+    client.post(
+        f"/api/v1/challenges/{challenge['id']}/submit",
+        headers=player_headers,
+        json={"flag": "SYC{defense_is_an_engineering_discipline}"},
+    )
+    attack_detail = client.get(
+        f"/api/v1/challenges/{challenge['id']}", headers=player_headers
+    ).json()
+    assert attack_detail["attack_solves"] == 1
+    assert attack_detail["defense_bloods"][0]["username"] == "player"
     other = auth_header(client, "other", "OtherPass123!")
     assert client.get(asset.json()["download_url"], headers=other).status_code == 404
+    assert client.delete(
+        f"/api/v1/challenges/{challenge['id']}", headers=admin_headers
+    ).status_code == 200
 
 
 def test_awdp_requires_admin_scripts_and_player_cannot_upload_fix(client, admin_headers, player_headers):
@@ -169,3 +209,73 @@ def test_admin_can_take_offline_and_delete_challenge_and_member(client, admin_he
     deleted = client.delete(f"/api/v1/challenges/{challenge['id']}", headers=admin_headers)
     assert deleted.status_code == 200
     assert client.get(f"/api/v1/challenges/{challenge['id']}", headers=admin_headers).status_code == 404
+
+
+def test_admin_builds_uploaded_archive_immediately(client, admin_headers):
+    payload = {
+        "title": "Uploaded Calc",
+        "slug": "uploaded-calc",
+        "description": "# Calculator\n\nExploit the uploaded calculator service.",
+        "category": "Pwn",
+        "mode": "ctf",
+        "difficulty": "noob",
+        "points": 50,
+        "flag": "SYC{calc}",
+        "status": "draft",
+    }
+    challenge = client.post("/api/v1/challenges", headers=admin_headers, json=payload).json()
+    archive = io.BytesIO()
+    with ZipFile(archive, "w") as bundle:
+        bundle.writestr("calc/Dockerfile", "FROM alpine:3.20\nEXPOSE 9999\nCMD [\"true\"]\n")
+        bundle.writestr("calc/readme.txt", "build context")
+    built = client.post(
+        f"/api/v1/challenges/{challenge['id']}/build?filename=calc.zip",
+        headers={**admin_headers, "Content-Type": "application/zip"},
+        content=archive.getvalue(),
+    )
+    assert built.status_code == 200
+    assert built.json()["status"] == "success"
+    assert built.json()["internal_port"] == 9999
+    detail = client.get(f"/api/v1/challenges/{challenge['id']}", headers=admin_headers).json()
+    assert detail["build_status"] == "success"
+    assert detail["docker_image"].endswith(":alpha0.0.2")
+
+    unsafe = io.BytesIO()
+    with ZipFile(unsafe, "w") as bundle:
+        bundle.writestr("../Dockerfile", "FROM scratch")
+    rejected = client.post(
+        f"/api/v1/challenges/{challenge['id']}/build?filename=unsafe.zip",
+        headers={**admin_headers, "Content-Type": "application/zip"},
+        content=unsafe.getvalue(),
+    )
+    assert rejected.status_code == 422
+
+
+def test_hint_lifecycle_and_player_visibility(client, admin_headers, player_headers):
+    challenge = next(
+        item for item in client.get("/api/v1/challenges?mode=ctf", headers=admin_headers).json()
+        if item["slug"] == "welcome-header"
+    )
+    created = client.post(
+        f"/api/v1/challenges/{challenge['id']}/hints",
+        headers=admin_headers,
+        json={"title": "Headers", "content": "Inspect the **response headers**.", "status": "draft"},
+    )
+    assert created.status_code == 201
+    hint = created.json()
+    assert client.get(
+        f"/api/v1/challenges/{challenge['id']}/hints", headers=player_headers
+    ).json() == []
+    online = client.patch(
+        f"/api/v1/challenges/hints/{hint['id']}",
+        headers=admin_headers,
+        json={"status": "published"},
+    )
+    assert online.status_code == 200
+    visible = client.get(
+        f"/api/v1/challenges/{challenge['id']}/hints", headers=player_headers
+    ).json()
+    assert visible[0]["content"] == "Inspect the **response headers**."
+    assert client.delete(
+        f"/api/v1/challenges/hints/{hint['id']}", headers=admin_headers
+    ).status_code == 200

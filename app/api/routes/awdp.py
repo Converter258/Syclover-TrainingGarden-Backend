@@ -196,6 +196,12 @@ async def deploy_defense_asset(
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (event_id, instance_id, asset_id, user["id"], int(success), output[:20_000], created_at),
         )
+        if success and user["role"] == "player":
+            connection.execute(
+                "INSERT OR IGNORE INTO defense_solves "
+                "(id, user_id, challenge_id, event_id, created_at) VALUES (?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), user["id"], instance["challenge_id"], event_id, created_at),
+            )
         row = connection.execute(
             "SELECT id, instance_id, asset_id, success, output, created_at FROM deployment_events WHERE id = ?",
             (event_id,),

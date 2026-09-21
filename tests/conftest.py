@@ -50,11 +50,20 @@ def settings(tmp_path: Path) -> Settings:
         token_ttl_minutes=60,
         instance_ttl_minutes=10,
         instance_public_host="testserver",
+        instance_bind_address="127.0.0.1",
+        instance_port_range_start=None,
+        instance_port_range_end=None,
+        instance_reaper_enabled=False,
+        instance_reaper_interval_seconds=60,
+        instance_start_async=False,
+        flag_prefix="SYC",
+        public_base_url="",
         docker_mode="mock",
         seed_demo=True,
         admin_username="admin",
         admin_password="AdminPass123!",
         max_upload_bytes=1024 * 1024,
+        max_build_upload_bytes=8 * 1024 * 1024,
     )
 
 

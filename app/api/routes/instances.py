@@ -1,50 +1,116 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
 from app.api.deps import CurrentUser, DatabaseDep, DockerDep, SettingsDep
 from app.schemas import InstancePublic, Message
 from app.services.docker import ContainerError
+from app.services.flags import render_instance_flag
+from app.services.reaper import expire_instances
 
 router = APIRouter(prefix="/instances", tags=["instances"])
+logger = logging.getLogger("syclover.instances")
+
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
 
 
-def _serialize(row) -> InstancePublic:
-    return InstancePublic.model_validate(dict(row))
+def _client_host(request: Request) -> str | None:
+    """Hostname the browser used to reach the platform, honouring a trusted proxy."""
+    forwarded = request.headers.get("x-forwarded-host")
+    candidate = (forwarded.split(",")[0] if forwarded else request.headers.get("host", "")).strip()
+    if not candidate:
+        return None
+    if candidate.startswith("["):
+        return candidate.split("]")[0].lstrip("[") or None
+    return candidate.rsplit(":", 1)[0] or None
 
 
-def _expire_instances(user: dict, database, docker) -> None:
-    now = datetime.now(UTC)
-    with database.connect() as connection:
-        rows = connection.execute(
-            "SELECT id, container_id, expires_at FROM instances "
-            "WHERE user_id = ? AND status IN ('starting', 'running')",
-            (user["id"],),
-        ).fetchall()
-    for row in rows:
-        expires_at = datetime.fromisoformat(row["expires_at"])
-        if expires_at > now:
-            continue
-        error = None
-        if row["container_id"]:
-            try:
-                docker.stop(row["container_id"])
-            except ContainerError as exc:
-                error = str(exc)
+def _effective_public_host(request: Request, settings) -> str:
+    """Address players should connect challenge instances on.
+
+    An explicitly configured host wins; otherwise reuse the hostname the player is
+    already using for the platform, which is by definition reachable for them.
+    """
+    configured = (settings.instance_public_host or "").strip()
+    if configured and configured.lower() not in LOOPBACK_HOSTS:
+        return configured
+    return _client_host(request) or configured or "localhost"
+
+
+def _serialize(row, user: dict | None = None, public_host: str | None = None) -> InstancePublic:
+    data = dict(row)
+    if public_host and data.get("public_port"):
+        data["public_host"] = public_host
+    if user is not None:
+        data["mine"] = data.get("user_id") == user["id"]
+    return InstancePublic.model_validate(data)
+
+
+def _launch_instance(instance_id: str, public_host: str, launch: dict, database, docker) -> None:
+    """Start one challenge container outside the request/response cycle."""
+    try:
+        started = docker.start(**launch)
+    except ContainerError as exc:
+        logger.warning("Instance %s failed to start: %s", instance_id, exc)
         with database.connect() as connection:
             connection.execute(
-                "UPDATE instances SET status = 'stopped', stopped_at = ?, error_message = COALESCE(?, error_message) "
-                "WHERE id = ? AND status IN ('starting', 'running')",
-                (now.isoformat(), error, row["id"]),
+                "UPDATE instances SET status = 'failed', error_message = ? "
+                "WHERE id = ? AND status = 'starting'",
+                (str(exc), instance_id),
+            )
+        return
+    with database.connect() as connection:
+        connection.execute(
+            "UPDATE instances SET container_id = ?, public_host = ?, public_port = ?, status = 'running' "
+            "WHERE id = ? AND status = 'starting'",
+            (started.container_id, public_host, started.public_port, instance_id),
+        )
+
+
+def _reclaim(database, docker) -> None:
+    """Reclaim expired instances before answering a request, for all users."""
+    expire_instances(database, docker)
+
+
+def _reflect_dead_containers(user: dict, database, docker) -> None:
+    """Mark instances whose container vanished without the platform stopping it."""
+    with database.connect() as connection:
+        if user["role"] == "admin":
+            rows = connection.execute(
+                "SELECT id, container_id FROM instances WHERE status = 'running'"
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT id, container_id FROM instances WHERE status = 'running' AND user_id = ?",
+                (user["id"],),
+            ).fetchall()
+    for row in rows:
+        if not row["container_id"] or docker.container_exists(row["container_id"]):
+            continue
+        with database.connect() as connection:
+            connection.execute(
+                "UPDATE instances SET status = 'failed', stopped_at = ?, "
+                "error_message = COALESCE(error_message, 'Container exited unexpectedly') "
+                "WHERE id = ? AND status = 'running'",
+                (datetime.now(UTC).isoformat(), row["id"]),
             )
 
 
 @router.get("", response_model=list[InstancePublic])
-async def list_instances(user: CurrentUser, database: DatabaseDep, docker: DockerDep) -> list[InstancePublic]:
-    _expire_instances(user, database, docker)
+async def list_instances(
+    request: Request,
+    user: CurrentUser,
+    database: DatabaseDep,
+    docker: DockerDep,
+    settings: SettingsDep,
+) -> list[InstancePublic]:
+    _reclaim(database, docker)
+    _reflect_dead_containers(user, database, docker)
+    public_host = _effective_public_host(request, settings)
     with database.connect() as connection:
         if user["role"] == "admin":
             rows = connection.execute(
@@ -58,18 +124,21 @@ async def list_instances(user: CurrentUser, database: DatabaseDep, docker: Docke
                 "ORDER BY i.created_at DESC",
                 (user["id"],),
             ).fetchall()
-    return [_serialize(row) for row in rows]
+    return [_serialize(row, user, public_host) for row in rows]
 
 
 @router.post("/{challenge_id}", response_model=InstancePublic, status_code=status.HTTP_201_CREATED)
 async def start_instance(
     challenge_id: str,
+    request: Request,
     user: CurrentUser,
     database: DatabaseDep,
     settings: SettingsDep,
     docker: DockerDep,
+    background: BackgroundTasks,
 ) -> InstancePublic:
-    _expire_instances(user, database, docker)
+    _reclaim(database, docker)
+    _reflect_dead_containers(user, database, docker)
     with database.connect() as connection:
         challenge = connection.execute(
             "SELECT * FROM challenges WHERE id = ?", (challenge_id,)
@@ -88,26 +157,53 @@ async def start_instance(
 
     instance_id = str(uuid.uuid4())
     container_name = f"sycl-{instance_id.replace('-', '')[:20]}"
+    instance_flag = render_instance_flag(challenge["flag_template"], settings.flag_prefix)
     now = datetime.now(UTC)
     expires_at = now + timedelta(minutes=settings.instance_ttl_minutes)
     with database.connect() as connection:
         connection.execute(
             """
             INSERT INTO instances (
-                id, user_id, challenge_id, container_name, status, expires_at, created_at
-            ) VALUES (?, ?, ?, ?, 'starting', ?, ?)
+                id, user_id, challenge_id, container_name, instance_flag, status, expires_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?)
             """,
-            (instance_id, user["id"], challenge_id, container_name, expires_at.isoformat(), now.isoformat()),
+            (
+                instance_id,
+                user["id"],
+                challenge_id,
+                container_name,
+                instance_flag,
+                expires_at.isoformat(),
+                now.isoformat(),
+            ),
         )
 
+    launch = dict(
+        image=challenge["docker_image"],
+        internal_port=challenge["internal_port"],
+        name=container_name,
+        user_id=user["id"],
+        challenge_id=challenge_id,
+        bind_address=settings.instance_bind_address,
+        port_range=settings.instance_port_range,
+        flag=instance_flag,
+    )
+    public_host = _effective_public_host(request, settings)
+
+    if settings.instance_start_async:
+        # Answer immediately so the UI can show live startup progress instead of
+        # holding one HTTP request open for the whole container start.
+        background.add_task(_launch_instance, instance_id, public_host, launch, database, docker)
+        with database.connect() as connection:
+            row = connection.execute(
+                "SELECT i.*, c.title AS challenge_title FROM instances i "
+                "JOIN challenges c ON c.id = i.challenge_id WHERE i.id = ?",
+                (instance_id,),
+            ).fetchone()
+        return _serialize(row, user, public_host)
+
     try:
-        started = docker.start(
-            image=challenge["docker_image"],
-            internal_port=challenge["internal_port"],
-            name=container_name,
-            user_id=user["id"],
-            challenge_id=challenge_id,
-        )
+        started = docker.start(**launch)
     except ContainerError as exc:
         with database.connect() as connection:
             connection.execute(
@@ -120,14 +216,34 @@ async def start_instance(
         connection.execute(
             "UPDATE instances SET container_id = ?, public_host = ?, public_port = ?, status = 'running' "
             "WHERE id = ?",
-            (started.container_id, settings.instance_public_host, started.public_port, instance_id),
+            (started.container_id, public_host, started.public_port, instance_id),
         )
         row = connection.execute(
             "SELECT i.*, c.title AS challenge_title FROM instances i JOIN challenges c ON c.id = i.challenge_id "
             "WHERE i.id = ?",
             (instance_id,),
         ).fetchone()
-    return _serialize(row)
+    return _serialize(row, user, public_host)
+
+
+@router.get("/{instance_id}", response_model=InstancePublic)
+async def get_instance(
+    instance_id: str,
+    request: Request,
+    user: CurrentUser,
+    database: DatabaseDep,
+    settings: SettingsDep,
+) -> InstancePublic:
+    """Single instance status, used by the UI while a container is starting."""
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT i.*, c.title AS challenge_title FROM instances i JOIN challenges c ON c.id = i.challenge_id "
+            "WHERE i.id = ?",
+            (instance_id,),
+        ).fetchone()
+    if not row or (row["user_id"] != user["id"] and user["role"] != "admin"):
+        raise HTTPException(status_code=404, detail="Instance not found")
+    return _serialize(row, user, _effective_public_host(request, settings))
 
 
 @router.delete("/{instance_id}", response_model=Message)

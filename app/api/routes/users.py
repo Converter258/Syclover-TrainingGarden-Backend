@@ -73,6 +73,7 @@ async def delete_user(
             except ContainerError:
                 pass
     with database.connect() as connection:
+        connection.execute("DELETE FROM defense_solves WHERE user_id = ?", (user_id,))
         connection.execute(
             "DELETE FROM deployment_events WHERE user_id = ? OR instance_id IN "
             "(SELECT id FROM instances WHERE user_id = ?) OR asset_id IN "
