@@ -168,9 +168,45 @@ def client(settings: Settings):
     yield ASGITestClient(application)
 
 
-def auth_header(client: ASGITestClient, username: str = "player", password: str = "PlayerPass123!"):
-    response = client.post("/api/v1/auth/register", json={"username": username, "password": password})
-    assert response.status_code == 201
+ROOT_ADMIN_USERNAME = "Syclover"
+ROOT_ADMIN_PASSWORD = "AdminPass123!"
+
+
+def admin_login(client: ASGITestClient) -> dict[str, str]:
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"username": ROOT_ADMIN_USERNAME, "password": ROOT_ADMIN_PASSWORD},
+    )
+    assert response.status_code == 200, response.text
+    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def issue_invite_codes(
+    client: ASGITestClient, count: int = 1, headers: dict[str, str] | None = None
+) -> list[str]:
+    """Mint registration codes the way an administrator would."""
+    response = client.post(
+        "/api/v1/invites",
+        json={"count": count},
+        headers=headers if headers is not None else admin_login(client),
+    )
+    assert response.status_code == 201, response.text
+    return [item["code"] for item in response.json()]
+
+
+def auth_header(
+    client: ASGITestClient,
+    username: str = "player",
+    password: str = "PlayerPass123!",
+    invite_code: str | None = None,
+):
+    """Register a player through the invitation-only flow and return its headers."""
+    code = invite_code if invite_code is not None else issue_invite_codes(client)[0]
+    response = client.post(
+        "/api/v1/auth/register",
+        json={"username": username, "password": password, "invite_code": code},
+    )
+    assert response.status_code == 201, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 
@@ -181,6 +217,4 @@ def player_headers(client: ASGITestClient):
 
 @pytest.fixture()
 def admin_headers(client: ASGITestClient):
-    response = client.post("/api/v1/auth/login", json={"username": "Syclover", "password": "AdminPass123!"})
-    assert response.status_code == 200
-    return {"Authorization": f"Bearer {response.json()['access_token']}"}
+    return admin_login(client)

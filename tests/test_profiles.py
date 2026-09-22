@@ -1,10 +1,14 @@
-from tests.conftest import ASGITestClient
+from tests.conftest import ASGITestClient, issue_invite_codes
 
 
 def test_registration_adds_sprout_badge_and_profile_can_be_updated(client: ASGITestClient):
     response = client.post(
         "/api/v1/auth/register",
-        json={"username": "profile_player", "password": "PlayerPass123!"},
+        json={
+            "username": "profile_player",
+            "password": "PlayerPass123!",
+            "invite_code": issue_invite_codes(client)[0],
+        },
     )
     assert response.status_code == 201
     payload = response.json()
@@ -36,7 +40,11 @@ def test_admin_can_grant_core_badge_and_player_can_change_password(
 ):
     registration = client.post(
         "/api/v1/auth/register",
-        json={"username": "core_candidate", "password": "PlayerPass123!"},
+        json={
+            "username": "core_candidate",
+            "password": "PlayerPass123!",
+            "invite_code": issue_invite_codes(client)[0],
+        },
     ).json()
     player_headers = {"Authorization": f"Bearer {registration['access_token']}"}
     user_id = registration["user"]["id"]

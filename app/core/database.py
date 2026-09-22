@@ -150,6 +150,18 @@ CREATE TABLE IF NOT EXISTS challenge_tags (
     PRIMARY KEY (challenge_id, tag_id)
 );
 
+CREATE TABLE IF NOT EXISTS invite_codes (
+    id TEXT PRIMARY KEY,
+    code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    note TEXT,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    used_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_invite_codes_used_at ON invite_codes(used_at);
+
 CREATE INDEX IF NOT EXISTS idx_submissions_challenge_correct_created
 ON submissions(challenge_id, correct, created_at);
 CREATE INDEX IF NOT EXISTS idx_defense_solves_challenge_created
