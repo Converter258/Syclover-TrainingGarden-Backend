@@ -99,7 +99,10 @@ def test_deleting_a_challenge_removes_the_image_it_built(client, admin_headers, 
     from app.main import create_app  # noqa: F401  (documents the dependency wire-up)
 
     app = client.app
-    app.dependency_overrides[get_docker_service] = lambda: RecordingDocker()
+    async def recording_docker():
+        return RecordingDocker()
+
+    app.dependency_overrides[get_docker_service] = recording_docker
     try:
         created = client.post(
             "/api/v1/challenges",

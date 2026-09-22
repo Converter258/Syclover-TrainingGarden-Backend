@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'player' CHECK (role IN ('player', 'admin')),
+    role TEXT NOT NULL DEFAULT 'player' CHECK (role IN ('player', 'admin', 'root_admin')),
     is_active INTEGER NOT NULL DEFAULT 1,
     avatar_url TEXT,
     signature TEXT,
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS achievements (
     slug TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
+    acquisition TEXT NOT NULL,
     icon TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -168,8 +169,9 @@ DEFAULT_TAGS = (
 )
 
 ACHIEVEMENT_DEFINITIONS = (
-    ("sprout_member", "新芽组成员", "完成注册，加入 Syclover Training Garden。", "sprout"),
-    ("core_member", "核心组成员", "由管理员授予的核心组成员徽章。", "core"),
+    ("sprout_member", "新芽组成员", "学习、汲取、成长", "注册自动获取", "sprout"),
+    ("core_member", "核心组成员", "热爱、坚持、成就", "管理员下发", "core"),
+    ("peak_geek_2025", "Peak Geek 2025", "完成 2025 极客大挑战所有题目", "完成 2025 极客大挑战全部题目", "peak-geek"),
 )
 
 
@@ -183,6 +185,8 @@ class Database:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
         self._migrate_user_profile()
+        self._migrate_user_roles()
+        self._migrate_achievement_catalog()
         self._migrate_flags()
         self._seed_tags()
         self._seed_achievements()
@@ -204,11 +208,16 @@ class Database:
         """Keep the built-in achievement catalog and registration badge available."""
         now = datetime.now(UTC).isoformat()
         with self.connect() as connection:
-            for slug, name, description, icon in ACHIEVEMENT_DEFINITIONS:
+            for slug, name, description, acquisition, icon in ACHIEVEMENT_DEFINITIONS:
                 connection.execute(
                     "INSERT OR IGNORE INTO achievements "
-                    "(slug, name, description, icon, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (slug, name, description, icon, now),
+                    "(slug, name, description, acquisition, icon, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (slug, name, description, acquisition, icon, now),
+                )
+                connection.execute(
+                    "UPDATE achievements SET name = ?, description = ?, acquisition = ?, icon = ? "
+                    "WHERE slug = ?",
+                    (name, description, acquisition, icon, slug),
                 )
             user_rows = connection.execute("SELECT id FROM users").fetchall()
             connection.executemany(
@@ -216,6 +225,54 @@ class Database:
                 "(user_id, achievement_slug, awarded_at) VALUES (?, 'sprout_member', ?)",
                 [(row["id"], now) for row in user_rows],
             )
+            connection.execute(
+                "DELETE FROM user_achievements WHERE achievement_slug = 'sprout_member' "
+                "AND EXISTS (SELECT 1 FROM user_achievements core WHERE core.user_id = user_achievements.user_id "
+                "AND core.achievement_slug = 'core_member')"
+            )
+
+    def _migrate_achievement_catalog(self) -> None:
+        with self.connect() as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(achievements)").fetchall()}
+            if columns and "acquisition" not in columns:
+                connection.execute(
+                    "ALTER TABLE achievements ADD COLUMN acquisition TEXT NOT NULL DEFAULT '管理员下发'"
+                )
+
+    def _migrate_user_roles(self) -> None:
+        """Allow root administrators and promote legacy administrators during upgrade."""
+        connection = sqlite3.connect(self.path, timeout=10)
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            table = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+            ).fetchone()
+            if not table or "'root_admin'" in table[0]:
+                return
+            connection.executescript(
+                """
+                CREATE TABLE users_v2 (
+                    id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'player' CHECK (role IN ('player', 'admin', 'root_admin')),
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    avatar_url TEXT,
+                    signature TEXT,
+                    direction TEXT CHECK (direction IN ('Web', 'Pwn', 'Reverse', 'Crypto', 'Misc')),
+                    created_at TEXT NOT NULL
+                );
+                INSERT INTO users_v2 (id, username, password_hash, role, is_active, avatar_url, signature, direction, created_at)
+                SELECT id, username, password_hash, role,
+                       is_active, avatar_url, signature, direction, created_at
+                FROM users;
+                DROP TABLE users;
+                ALTER TABLE users_v2 RENAME TO users;
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def _migrate_flags(self) -> None:
         """Convert Alpha0.0.2 ``<RANDOM>`` templates to the RAND token used since 0.0.3.

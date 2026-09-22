@@ -10,7 +10,7 @@ def test_register_login_and_admin_permissions(client, player_headers, admin_head
     assert client.get("/api/v1/users", headers=player_headers).status_code == 403
     users = client.get("/api/v1/users", headers=admin_headers)
     assert users.status_code == 200
-    assert {item["username"] for item in users.json()} == {"admin", "player"}
+    assert {item["username"] for item in users.json()} == {"Syclover", "player"}
 
 
 def test_flag_submission_awards_only_once_and_updates_scoreboard(client, player_headers):
@@ -141,10 +141,14 @@ def test_awdp_asset_validation_deploy_and_ownership(client, player_headers, admi
         item for item in client.get("/api/v1/challenges?mode=awdp", headers=player_headers).json()
         if item["slug"] == "service-under-fire"
     )
+    patch = io.BytesIO()
+    with ZipFile(patch, "w") as bundle:
+        bundle.writestr("fix.sh", "#!/bin/sh\nexit 0\n")
+        bundle.writestr("target.bin", b"patched binary")
     asset = client.post(
-        f"/api/v1/awdp/{challenge['id']}/assets?kind=patch&filename=fix.patch",
-        headers={**player_headers, "Content-Type": "application/octet-stream"},
-        content=b"--- a/index.html\n+++ b/index.html\n@@ -1 +1 @@\n-old\n+fixed\n",
+        f"/api/v1/awdp/{challenge['id']}/assets?kind=patch&filename=patch.zip",
+        headers={**player_headers, "Content-Type": "application/zip"},
+        content=patch.getvalue(),
     )
     assert asset.status_code == 201
     assert asset.json()["validation_status"] == "valid"

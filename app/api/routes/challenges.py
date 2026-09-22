@@ -39,6 +39,7 @@ from app.services.assets import (
     safe_filename,
     store_bytes,
 )
+from app.services.achievements import maybe_grant_peak_geek_2025
 from app.services.build_log import IDLE_LIMIT_SECONDS, POLL_SECONDS, registry
 from app.services.docker import ContainerError
 from app.services.flags import (
@@ -152,7 +153,7 @@ async def list_challenges(
     mode: str | None = Query(default=None, pattern="^(ctf|awdp)$"),
     tag: str | None = Query(default=None, max_length=32),
 ) -> list[ChallengePublic]:
-    conditions = [] if user["role"] == "admin" else ["c.status = 'published'"]
+    conditions = [] if user["role"] in {"admin", "root_admin"} else ["c.status = 'published'"]
     values: list[str] = []
     if mode:
         conditions.append("c.mode = ?")
@@ -201,7 +202,7 @@ async def list_challenges(
                 row,
                 bool(row["solved"]),
                 stats=_challenge_stats(connection, row["id"], row["mode"]),
-                reveal_template=user["role"] == "admin",
+                reveal_template=user["role"] in {"admin", "root_admin"},
                 tags=tag_map.get(row["id"], []),
             )
             for row in rows
@@ -225,7 +226,7 @@ async def get_challenge(challenge_id: str, user: CurrentUser, database: Database
             """,
             (challenge_id,),
         ).fetchone()
-        if not row or (row["status"] != "published" and user["role"] != "admin"):
+        if not row or (row["status"] != "published" and user["role"] not in {"admin", "root_admin"}):
             raise HTTPException(status_code=404, detail="Challenge not found")
         solved = connection.execute(
             "SELECT 1 FROM submissions WHERE challenge_id = ? AND user_id = ? AND correct = 1",
@@ -242,7 +243,7 @@ async def get_challenge(challenge_id: str, user: CurrentUser, database: Database
         bool(solved),
         [_asset(asset) for asset in assets],
         stats,
-        reveal_template=user["role"] == "admin",
+        reveal_template=user["role"] in {"admin", "root_admin"},
         tags=tags,
     )
 
@@ -259,7 +260,7 @@ async def submit_flag(
         challenge = connection.execute(
             "SELECT id, points, flag_digest, status FROM challenges WHERE id = ?", (challenge_id,)
         ).fetchone()
-        if not challenge or (challenge["status"] != "published" and user["role"] != "admin"):
+        if not challenge or (challenge["status"] != "published" and user["role"] not in {"admin", "root_admin"}):
             raise HTTPException(status_code=404, detail="Challenge not found")
         active_instance = connection.execute(
             "SELECT id, instance_flag FROM instances WHERE user_id = ? AND challenge_id = ? "
@@ -291,6 +292,8 @@ async def submit_flag(
                 datetime.now(UTC).isoformat(),
             ),
         )
+        if correct:
+            maybe_grant_peak_geek_2025(connection, user["id"])
     if not correct:
         return SubmissionResult(correct=False, awarded_points=0, message="Flag is incorrect")
     if awarded == 0:
@@ -870,9 +873,9 @@ async def list_hints(
         challenge = connection.execute(
             "SELECT status FROM challenges WHERE id = ?", (challenge_id,)
         ).fetchone()
-        if not challenge or (challenge["status"] != "published" and user["role"] != "admin"):
+        if not challenge or (challenge["status"] != "published" and user["role"] not in {"admin", "root_admin"}):
             raise HTTPException(status_code=404, detail="Challenge not found")
-        if user["role"] == "admin":
+        if user["role"] in {"admin", "root_admin"}:
             rows = connection.execute(
                 "SELECT * FROM hints WHERE challenge_id = ? ORDER BY created_at",
                 (challenge_id,),
@@ -942,7 +945,7 @@ async def download_asset(asset_id: str, user: CurrentUser, database: DatabaseDep
         row = connection.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="Asset not found")
-    if row["kind"] != "attachment" and row["user_id"] != user["id"] and user["role"] != "admin":
+    if row["kind"] != "attachment" and row["user_id"] != user["id"] and user["role"] not in {"admin", "root_admin"}:
         raise HTTPException(status_code=404, detail="Asset not found")
     path = settings.storage_path / row["stored_name"]
     if not path.is_file():

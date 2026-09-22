@@ -1,12 +1,14 @@
 # Syclover Training Garden Backend
 
-当前版本：**Alpha0.0.5**。每个账号最多同时运行 2 个题目环境；停止或过期后可继续启动。
+当前版本：**Alpha0.0.6**。每个账号最多同时运行 2 个题目环境；停止或过期后可继续启动。
 
-版本：**Alpha0.0.5**
+版本：**Alpha0.0.6**
 
 FastAPI + SQLite 实现的训练平台 API，包含认证与权限、独立 CTF/AWDP 题库、ZIP 即时镜像构建、Docker 实例、Flag 计分、攻防独立血榜、Markdown Hints、附件、AWDP Check/Fix/Patch 工作流、后台实例回收和独立排行榜。
 
-默认不会创建演示题目。只有显式设置 `SYCL_SEED_DEMO=true` 时才会写入测试用演示题；生产部署可直接创建自己的题库。Alpha0.0.5 还提供个人资料、方向、成就徽章和密码修改接口。
+初始化不会创建演示题目，生产题库需要由管理员自行创建。根管理员用户名固定为 `Syclover`，密码由 `SYCL_ADMIN_PASSWORD` 首次初始化时设置；普通管理员只能管理题目、题目内容和题目标签。Alpha0.0.6 还提供个人资料、方向、成就徽章和密码修改接口。
+
+AWDP 防御选手上传 `patch.zip`：Pwn 包必须包含根目录 `fix.sh` 和一个修改后的二进制，Web 包必须包含根目录 `fix.sh` 和至少一个源码或资源文件。部署时平台将内容覆盖到容器 `/app` 并执行 `fix.sh`。
 
 ```bash
 python -m venv .venv

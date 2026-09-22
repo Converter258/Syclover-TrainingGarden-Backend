@@ -94,7 +94,9 @@ def get_settings() -> Settings:
         public_base_url=os.getenv("SYCL_PUBLIC_BASE_URL", "").strip().rstrip("/"),
         docker_mode=os.getenv("SYCL_DOCKER_MODE", "cli"),
         seed_demo=_as_bool(os.getenv("SYCL_SEED_DEMO"), False),
-        admin_username=os.getenv("SYCL_ADMIN_USERNAME", "admin"),
+        # Kept under the legacy field name for deployment compatibility. The root
+        # administrator username is fixed by the platform contract.
+        admin_username="Syclover",
         admin_password=os.getenv("SYCL_ADMIN_PASSWORD", "Syclover@2026") or None,
         max_upload_bytes=int(os.getenv("SYCL_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))),
         max_build_upload_bytes=int(
