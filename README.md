@@ -1,6 +1,6 @@
 # Syclover Training Garden Backend
 
-版本：**Alpha0.0.3**
+版本：**Alpha0.0.4**
 
 FastAPI + SQLite 实现的训练平台 API，包含认证与权限、独立 CTF/AWDP 题库、ZIP 即时镜像构建、Docker 实例、Flag 计分、攻防独立血榜、Markdown Hints、附件、AWDP Check/Fix/Patch 工作流、后台实例回收和独立排行榜。
 

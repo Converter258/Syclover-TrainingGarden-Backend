@@ -8,7 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
 from app.api.deps import CurrentUser, DatabaseDep, DockerDep, SettingsDep
 from app.schemas import InstancePublic, Message
-from app.services.docker import ContainerError
+from app.services.docker import FLAG_PATTERN, ContainerError
 from app.services.flags import render_instance_flag
 from app.services.reaper import expire_instances
 
@@ -32,13 +32,21 @@ def _client_host(request: Request) -> str | None:
 def _effective_public_host(request: Request, settings) -> str:
     """Address players should connect challenge instances on.
 
-    An explicitly configured host wins; otherwise reuse the hostname the player is
-    already using for the platform, which is by definition reachable for them.
+    The container ports are published on ``SYCL_INSTANCE_BIND_ADDRESS``, so the reported
+    address must match it or the UI would advertise a link that cannot work:
+
+    * a wildcard bind means "any interface", so the platform reuses the hostname the
+      player reached the platform on;
+    * a concrete bind address is reported as-is;
+    * otherwise the configured ``SYCL_INSTANCE_PUBLIC_HOST`` is used.
     """
     configured = (settings.instance_public_host or "").strip()
-    if configured and configured.lower() not in LOOPBACK_HOSTS:
-        return configured
-    return _client_host(request) or configured or "localhost"
+    bind = (settings.instance_bind_address or "").strip()
+    if bind in {"0.0.0.0", "::", "[::]"}:
+        return _client_host(request) or configured or "localhost"
+    if bind:
+        return bind
+    return configured or _client_host(request) or "localhost"
 
 
 def _serialize(row, user: dict | None = None, public_host: str | None = None) -> InstancePublic:
@@ -192,6 +200,24 @@ async def start_instance(
         dynamic=bool(challenge["dynamic_flag"]),
         default_prefix=settings.flag_prefix,
     )
+    if not FLAG_PATTERN.fullmatch(instance_flag):
+        # Never let a malformed flag fail the whole start with an opaque container error:
+        # fall back to the literal template, then explain what is wrong with it.
+        fallback = (challenge["flag_template"] or "").strip()
+        if fallback and FLAG_PATTERN.fullmatch(fallback):
+            logger.warning(
+                "Challenge %s produced an invalid dynamic flag; using the literal template",
+                challenge_id,
+            )
+            instance_flag = fallback
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "This challenge has no usable flag: set a flag like SYC{...} - the "
+                    "dynamic switch replaces the RAND token with a random value per instance"
+                ),
+            )
     now = datetime.now(UTC)
     expires_at = now + timedelta(minutes=settings.instance_ttl_minutes)
     with database.connect() as connection:

@@ -129,9 +129,10 @@ def test_sweep_reports_both_reclamations(tmp_path):
 
 
 def test_docker_port_spec_honours_bind_address_and_range():
-    assert DockerService._port_spec("127.0.0.1", 9999, None) == "127.0.0.1::9999"
+    # the caller passes the address resolved by _publish_bind
     assert DockerService._port_spec("0.0.0.0", 9999, None) == "0.0.0.0::9999"
-    assert DockerService._port_spec("::1", 9999, None) == "[::1]::9999"
+    assert DockerService._port_spec("127.0.0.1", 9999, None) == "127.0.0.1::9999"
+    assert DockerService._port_spec("::", 9999, None) == "[::]::9999"
     assert DockerService._port_spec("127.0.0.1", 9999, range(30000, 30001)) == "127.0.0.1:30000:9999"
     assert DockerService._port_spec("0.0.0.0", 9999, range(30000, 30100)) == "0.0.0.0::9999"
 
@@ -172,6 +173,7 @@ def test_docker_start_uses_configured_bind_address_and_range(monkeypatch, tmp_pa
     )
 
     assert started.public_port == 32000
+    # an explicit range is what allows the container to be registered on 0.0.0.0
     assert "0.0.0.0::9999" in commands[0]
 
 

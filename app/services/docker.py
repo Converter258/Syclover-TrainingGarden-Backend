@@ -90,14 +90,15 @@ class DockerService:
             ],
             timeout=90,
         ).strip()
-        port_output = self._run(
-            ["docker", "port", container_id, f"{internal_port}/tcp"], timeout=10
-        ).strip()
-        try:
-            public_port = int(port_output.rsplit(":", 1)[1])
-        except (IndexError, ValueError) as exc:
+        public_port = self._await_published_port(container_id, internal_port)
+        if public_port is None:
+            logs = self.container_logs(container_id)
             self.stop(container_id)
-            raise ContainerError(f"Docker returned an invalid port mapping: {port_output}") from exc
+            detail = f" Last output: {logs}" if logs else ""
+            raise ContainerError(
+                "The container did not stay up long enough to publish its port; check the "
+                f"challenge command and port.{detail}"
+            )
         if port_range is not None and public_port not in port_range:
             self.stop(container_id)
             raise ContainerError(
@@ -226,6 +227,37 @@ class DockerService:
             containers.append({"id": parts[0].strip(), "name": parts[1].strip()})
         return containers
 
+    def _await_published_port(
+        self, container_id: str, internal_port: int, attempts: int = 5, delay: float = 0.6
+    ) -> int | None:
+        """Read the host port Docker published, tolerating a short start-up window."""
+        for attempt in range(attempts):
+            output = ""
+            try:
+                output = self._run(
+                    ["docker", "port", container_id, f"{internal_port}/tcp"], timeout=10
+                ).strip()
+            except ContainerError:
+                output = ""
+            for line in output.splitlines():
+                _, _, port = line.rpartition(":")
+                if port.isdigit():
+                    return int(port)
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+        return None
+
+    def container_logs(self, container_id: str, tail: int = 5) -> str:
+        """Best-effort tail of a container log, used to explain start failures."""
+        if self.mode == "mock" or not CONTAINER_PATTERN.fullmatch(container_id):
+            return ""
+        try:
+            return self._run(
+                ["docker", "logs", "--tail", str(tail), container_id], timeout=10
+            ).strip()[:500]
+        except ContainerError:
+            return ""
+
     def container_port(self, container_id: str, internal_port: int) -> int | None:
         """Current host port published for a container, or ``None`` when it is gone.
 
@@ -268,6 +300,18 @@ class DockerService:
                 return
             time.sleep(1)
         raise ContainerError("The patched instance did not become reachable after a restart")
+
+    def remove_image(self, image: str) -> None:
+        """Delete a challenge image; failures are reported, never raised."""
+        if not IMAGE_PATTERN.fullmatch(image):
+            raise ContainerError("Unsafe image tag")
+        if self.mode == "mock":
+            return
+        try:
+            self._run(["docker", "image", "rm", image], timeout=30)
+        except ContainerError as exc:
+            # An image still referenced by a container cannot be removed; that is fine.
+            raise ContainerError(str(exc)) from exc
 
     def container_exists(self, container_id: str) -> bool:
         if not CONTAINER_PATTERN.fullmatch(container_id):

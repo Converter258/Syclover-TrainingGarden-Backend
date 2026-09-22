@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sqlite3
 import uuid
@@ -27,6 +28,7 @@ from app.schemas import (
     Message,
     SubmissionRequest,
     SubmissionResult,
+    TagCreate,
     TagPublic,
     TagUpdate,
     category_is_valid,
@@ -40,7 +42,6 @@ from app.services.assets import (
 from app.services.build_log import IDLE_LIMIT_SECONDS, POLL_SECONDS, registry
 from app.services.docker import ContainerError
 from app.services.flags import (
-    default_dynamic_flag,
     dynamic_flag_for_template,
     normalize_template,
     template_wants_random,
@@ -54,6 +55,7 @@ from app.services.tags import (
 )
 
 router = APIRouter(prefix="/challenges", tags=["challenges"])
+logger = logging.getLogger("syclover.challenges")
 
 
 def _asset(row) -> AssetPublic:
@@ -337,7 +339,7 @@ async def build_challenge_image(
             (now, challenge_id),
         )
 
-    image = f"syclover/training-garden-{challenge['slug']}:alpha0.0.3"
+    image = f"syclover/training-garden-{challenge['slug']}:alpha0.0.4"
     registry.start(challenge_id)
     registry.append(
         challenge_id,
@@ -542,6 +544,37 @@ async def tag_catalog(_: CurrentUser, database: DatabaseDep) -> list[TagPublic]:
     return catalog
 
 
+@router.post("/tags", response_model=TagPublic, status_code=status.HTTP_201_CREATED)
+async def create_tag(payload: TagCreate, _: AdminUser, database: DatabaseDep) -> TagPublic:
+    """Create a topic tag up front so it can be attached to challenges afterwards."""
+    name = slugify_tag(payload.name)
+    if not name:
+        raise HTTPException(status_code=422, detail="Tag name is empty after normalization")
+    if name in STATE_TAGS:
+        raise HTTPException(
+            status_code=422, detail="static/dynamic are reserved tag names"
+        )
+    tag_id = str(uuid.uuid4())
+    try:
+        with database.connect() as connection:
+            connection.execute(
+                "INSERT INTO tags (id, name, kind, description, sort_order, created_at) "
+                "VALUES (?, ?, 'topic', ?, 100, ?)",
+                (tag_id, name, payload.description, datetime.now(UTC).isoformat()),
+            )
+            row = connection.execute(
+                """
+                SELECT t.id, t.name, t.kind, t.description,
+                       (SELECT COUNT(*) FROM challenge_tags ct WHERE ct.tag_id = t.id) AS challenge_count
+                FROM tags t WHERE t.id = ?
+                """,
+                (tag_id,),
+            ).fetchone()
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(status_code=409, detail="A tag with that name already exists") from exc
+    return TagPublic.model_validate(dict(row))
+
+
 @router.patch("/tags/{tag_id}", response_model=TagPublic)
 async def rename_tag(
     tag_id: str, payload: TagUpdate, _: AdminUser, database: DatabaseDep
@@ -608,8 +641,10 @@ async def create_challenge(
     now = datetime.now(UTC).isoformat()
     data = payload.model_dump(exclude={"flag", "tags", "dynamic_flag"})
     requested_tags = list(payload.tags)
+    # The legacy <RANDOM> token must be detected on the raw input: normalisation rewrites
+    # it to RAND, which is otherwise a plain literal.
+    dynamic_flag = dynamic_flag_for_template(payload.flag, payload.dynamic_flag)
     flag_template = normalize_template(payload.flag, settings.flag_prefix)
-    dynamic_flag = dynamic_flag_for_template(flag_template, payload.dynamic_flag)
     try:
         with database.connect() as connection:
             connection.execute(
@@ -671,13 +706,12 @@ async def update_challenge(
     new_tags = fields.pop("tags", None)
     requested_dynamic = fields.pop("dynamic_flag", None)
     if flag:
-        template = normalize_template(flag, settings.flag_prefix)
         fields["flag_digest"] = digest_flag(flag, settings.secret_key)
-        fields["flag_template"] = template
+        fields["flag_template"] = normalize_template(flag, settings.flag_prefix)
         fields["dynamic_flag"] = int(
-            default_dynamic_flag(flag)
+            dynamic_flag_for_template(flag, True)
             if requested_dynamic is None
-            else dynamic_flag_for_template(template, requested_dynamic)
+            else dynamic_flag_for_template(flag, requested_dynamic)
         )
     elif requested_dynamic is not None:
         # Toggling the switch alone keeps the stored flag text as the template.
@@ -752,7 +786,7 @@ async def delete_challenge(
 ) -> Message:
     with database.connect() as connection:
         challenge = connection.execute(
-            "SELECT id FROM challenges WHERE id = ?", (challenge_id,)
+            "SELECT id, docker_image FROM challenges WHERE id = ?", (challenge_id,)
         ).fetchone()
         instances = connection.execute(
             "SELECT container_id FROM instances WHERE challenge_id = ? AND status IN ('starting', 'running')",
@@ -785,6 +819,14 @@ async def delete_challenge(
         connection.execute("DELETE FROM challenges WHERE id = ?", (challenge_id,))
     for asset in assets:
         (settings.storage_path / asset["stored_name"]).unlink(missing_ok=True)
+    image = challenge["docker_image"]
+    if image and image.startswith("syclover/training-garden-"):
+        # The platform built this image from the challenge archive, so it is removed with
+        # the challenge. Shared base images are left alone.
+        try:
+            docker.remove_image(image)
+        except ContainerError as exc:
+            logger.warning("Challenge image %s could not be removed: %s", image, exc)
     return Message(message="Challenge deleted")
 
 

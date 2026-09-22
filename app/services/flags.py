@@ -5,6 +5,15 @@ literal flag. When the administrator enables the dynamic flag switch, the ``RAND
 token inside the template is replaced with a fresh random string for every instance and
 injected into the container as the ``FLAG`` environment variable, so command-line
 archives that write ``$FLAG`` into their flag file keep working unchanged.
+
+Rules that keep administrator intent intact:
+
+* the switch is the only thing that makes a flag dynamic - a literal flag that merely
+  contains the letters ``RAND`` is left alone;
+* the legacy ``<RANDOM>`` placeholder is converted to ``RAND`` instead of being dropped,
+  so an old flag never turns into an unusable template;
+* a flag always keeps a ``PREFIX{...}`` shape, because that is what the submission
+  formatcheck expects.
 """
 
 from __future__ import annotations
@@ -13,7 +22,7 @@ import re
 import secrets
 
 RAND_TOKEN = "RAND"
-LEGACY_PLACEHOLDER = "<RANDOM>"  # accepted for challenges created before the switch existed
+LEGACY_PLACEHOLDER = "<RANDOM>"  # written by Alpha0.0.2, still accepted
 DEFAULT_PREFIX = "SYC"
 FRAMED_TEMPLATE = re.compile(r"^(?P<prefix>[A-Za-z0-9_]{1,16})\{(?P<body>.*)\}$", re.DOTALL)
 SUBMITTED_FLAG = re.compile(r"^[^\s{}]{1,480}\{[^\s{}]{1,400}\}$")
@@ -30,36 +39,40 @@ def template_wants_random(template: str | None) -> bool:
     return RAND_TOKEN in candidate or LEGACY_PLACEHOLDER in candidate
 
 
-def default_dynamic_flag(flag: str) -> bool:
-    """A flag written with the RAND token implies the dynamic switch."""
-    candidate = (flag or "").strip()
-    return RAND_TOKEN in candidate or LEGACY_PLACEHOLDER in candidate
-
-
 def dynamic_flag_for_template(template: str | None, requested: bool) -> bool:
-    """The stored switch: an explicit administrator choice wins, otherwise infer the token."""
-    return bool(requested) or template_wants_random(template)
+    """The stored switch: an explicit administrator choice wins, otherwise infer the token.
+
+    A literal flag such as ``SYC{y0u_4r3_m4tH_G3nius_RAND}`` must not flip the switch on
+    its own, so only the unambiguous ``<RANDOM>`` placeholder is treated as a request.
+    """
+    return bool(requested) or LEGACY_PLACEHOLDER in (template or "")
 
 
 def randomize_template(template: str, replacement: str | None = None) -> str:
     """Replace the dynamic token with a concrete value; RAND wins over the legacy form."""
     secret = replacement or random_secret()
+    if LEGACY_PLACEHOLDER in template:
+        template = template.replace(LEGACY_PLACEHOLDER, RAND_TOKEN)
     if RAND_TOKEN in template:
         return template.replace(RAND_TOKEN, secret)
-    if LEGACY_PLACEHOLDER in template:
-        return template.replace(LEGACY_PLACEHOLDER, secret)
     return template
 
 
 def normalize_template(flag: str, default_prefix: str = DEFAULT_PREFIX) -> str:
-    """Keep the administrator's flag text; only malformed flags are rebuilt.
+    """Normalize an administrator supplied flag without losing its text.
 
-    A flag that does not look like ``PREFIX{...}`` is rebuilt as ``<PREFIX>{RAND}`` so a
-    shared literal secret is never handed to every instance by accident.
+    The stored template always looks like ``PREFIX{...}``. A bare ``<RANDOM>`` placeholder
+    is rewritten to ``RAND`` so an older flag keeps working, and a flag that has no
+    ``PREFIX{...}`` shape at all is wrapped in the configured prefix.
     """
     candidate = flag.strip()
+    if LEGACY_PLACEHOLDER in candidate and not FRAMED_TEMPLATE.match(candidate):
+        # e.g. "<RANDOM>" or "prefix-<RANDOM>": wrap it so the rendered value stays a flag.
+        prefix = (default_prefix or DEFAULT_PREFIX).strip() or DEFAULT_PREFIX
+        body = re.sub(r"[^A-Za-z0-9_.\-{}]", "_", candidate.replace(LEGACY_PLACEHOLDER, RAND_TOKEN))
+        return f"{prefix}{{{body or RAND_TOKEN}}}"
     if FRAMED_TEMPLATE.match(candidate):
-        return candidate
+        return candidate.replace(LEGACY_PLACEHOLDER, RAND_TOKEN)
     prefix = (default_prefix or DEFAULT_PREFIX).strip() or DEFAULT_PREFIX
     return f"{prefix}{{{RAND_TOKEN}}}"
 
@@ -82,7 +95,7 @@ def render_instance_flag(
     if match:
         # The switch is on but the template has no token: append a secret inside the braces.
         return f"{match.group('prefix')}{{{match.group('body')}{random_secret()}}}"
-    return f"{candidate}{random_secret()}"
+    return f"{candidate}{{{random_secret()}}}"
 
 
 def looks_like_flag(value: str) -> bool:

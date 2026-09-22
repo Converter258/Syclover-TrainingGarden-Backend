@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from app.services.docker import FLAG_PATTERN
 from app.services.flags import (
+    LEGACY_PLACEHOLDER,
     RAND_TOKEN,
-    default_dynamic_flag,
     dynamic_flag_for_template,
     looks_like_flag,
     normalize_template,
@@ -15,19 +16,55 @@ from tests.conftest import auth_header
 def test_normalize_template_keeps_the_administrator_text():
     assert normalize_template("SYC{fixed_value}") == "SYC{fixed_value}"
     assert normalize_template("SYC{RAND}") == "SYC{RAND}"
-    assert normalize_template("SYC{<RANDOM>}") == "SYC{<RANDOM>}"
+    # the legacy placeholder is upgraded rather than kept verbatim
+    assert normalize_template("SYC{<RANDOM>}") == "SYC{RAND}"
     # malformed flags are rebuilt so a shared literal is never handed to every instance
     assert normalize_template("plain-text-flag") == "SYC{RAND}"
     assert normalize_template("plain-text-flag", default_prefix="FLG") == "FLG{RAND}"
 
 
-def test_dynamic_switch_comes_from_the_token_or_the_admin():
-    assert default_dynamic_flag("SYC{RAND}") is True
-    assert default_dynamic_flag("SYC{fixed}") is False
+def test_dynamic_switch_follows_the_admin_and_the_legacy_placeholder():
+    # the switch is explicit: the RAND token alone must not randomise a literal flag
+    assert dynamic_flag_for_template("SYC{RAND}", False) is False
     assert dynamic_flag_for_template("SYC{fixed}", True) is True
-    assert dynamic_flag_for_template("SYC{RAND}", False) is True
+    assert dynamic_flag_for_template("SYC{fixed}", False) is False
+    # the Alpha0.0.2 placeholder always implies randomisation
+    assert dynamic_flag_for_template(f"SYC{LEGACY_PLACEHOLDER}", False) is True
     assert template_wants_random("SYC{RAND}") is True
     assert template_wants_random("SYC{fixed}") is False
+
+
+def test_literal_flag_containing_rand_is_left_alone():
+    """The reported bug: SYC{..._RAND} must not be mangled or randomised implicitly."""
+    flag = "SYC{y0u_4r3_m4tH_G3nius_RAND}"
+    template = normalize_template(flag)
+    assert template == flag
+    assert dynamic_flag_for_template(template, False) is False
+    assert render_instance_flag(template, dynamic=False) == flag
+    rendered = render_instance_flag(template, dynamic=True)
+    assert rendered.startswith("SYC{y0u_4r3_m4tH_G3nius_") and rendered.endswith("}")
+    assert rendered != flag and len(rendered) > len(flag)
+    assert FLAG_PATTERN.fullmatch(rendered)
+
+
+def test_legacy_placeholder_is_upgraded_instead_of_dropped():
+    assert normalize_template("SYC{<RANDOM>}") == "SYC{RAND}"
+    assert normalize_template("<RANDOM>") == "SYC{RAND}"
+    assert render_instance_flag("SYC{RAND}", dynamic=True).startswith("SYC{")
+
+
+def test_every_supported_flag_shape_renders_a_valid_instance_flag():
+    for flag, dynamic in (
+        ("SYC{y0u_4r3_m4tH_G3nius_RAND}", True),
+        ("SYC{y0u_4r3_m4tH_G3nius_RAND}", False),
+        ("SYC{<RANDOM>}", True),
+        ("SYC{fixed_value}", False),
+        ("SYC{fixed_value}", True),
+        ("plain-text-flag", True),
+    ):
+        template = normalize_template(flag)
+        enabled = dynamic_flag_for_template(template, dynamic)
+        assert FLAG_PATTERN.fullmatch(render_instance_flag(template, dynamic=enabled)), (flag, dynamic)
 
 
 def test_render_instance_flag_randomises_only_when_enabled():
@@ -86,6 +123,7 @@ def test_instance_flag_follows_its_own_instance(client, admin_headers, player_he
         "docker_image": "alpine:3.20",
         "internal_port": 9999,
         "flag": "SYCLOVER{RAND}",
+        "dynamic_flag": True,
         "status": "draft",
     }
     created = client.post("/api/v1/challenges", headers=admin_headers, json=payload)
@@ -208,4 +246,4 @@ def test_legacy_placeholder_flag_is_migrated_to_the_dynamic_switch(client, admin
         },
     ).json()
     assert created["dynamic_flag"] is True
-    assert created["flag_template"] == "SYC{<RANDOM>}"
+    assert created["flag_template"] == "SYC{RAND}"

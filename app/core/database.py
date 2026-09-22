@@ -156,7 +156,26 @@ class Database:
         self._migrate_legacy_constraints()
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+        self._migrate_flags()
         self._seed_tags()
+
+    def _migrate_flags(self) -> None:
+        """Convert Alpha0.0.2 ``<RANDOM>`` templates to the RAND token used since 0.0.3.
+
+        Without this an old template would be rendered literally (or rejected), which is
+        exactly what produced "Unsafe instance flag value" when starting an instance.
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, flag_template, dynamic_flag FROM challenges "
+                "WHERE flag_template LIKE '%<RANDOM>%'"
+            ).fetchall()
+            for row in rows:
+                template = (row["flag_template"] or "").replace("<RANDOM>", "RAND")
+                connection.execute(
+                    "UPDATE challenges SET flag_template = ?, dynamic_flag = 1 WHERE id = ?",
+                    (template, row["id"]),
+                )
 
     def _seed_tags(self) -> None:
         """Insert the default knowledge-point tags once, without touching later edits."""

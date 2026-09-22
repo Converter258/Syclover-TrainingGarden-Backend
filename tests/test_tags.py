@@ -85,6 +85,35 @@ def test_static_state_tag_follows_the_environment(client, admin_headers):
     assert promoted["tags"] == ["dynamic"]
 
 
+def test_deleting_a_challenge_removes_the_image_it_built(client, admin_headers, monkeypatch):
+    removed: list[str] = []
+
+    class RecordingDocker:
+        def stop(self, container_id):
+            return None
+
+        def remove_image(self, image):
+            removed.append(image)
+
+    from app.api.deps import get_docker_service
+    from app.main import create_app  # noqa: F401  (documents the dependency wire-up)
+
+    app = client.app
+    app.dependency_overrides[get_docker_service] = lambda: RecordingDocker()
+    try:
+        created = client.post(
+            "/api/v1/challenges",
+            headers=admin_headers,
+            json=_challenge_payload(
+                slug="image-cleanup", docker_image="syclover/training-garden-image-cleanup:alpha0.0.4"
+            ),
+        ).json()
+        assert client.delete(f"/api/v1/challenges/{created['id']}", headers=admin_headers).status_code == 200
+        assert removed == ["syclover/training-garden-image-cleanup:alpha0.0.4"]
+    finally:
+        app.dependency_overrides.pop(get_docker_service, None)
+
+
 def test_deleting_a_tagged_challenge_removes_its_tag_links(client, admin_headers):
     created = client.post(
         "/api/v1/challenges",
@@ -96,6 +125,43 @@ def test_deleting_a_tagged_challenge_removes_its_tag_links(client, admin_headers
     assert client.get(f"/api/v1/challenges/{created['id']}", headers=admin_headers).status_code == 404
     catalog = client.get("/api/v1/challenges/tags/catalog", headers=admin_headers).json()
     assert all(entry["name"] in {"web", "pwn", "reverse", "crypto", "misc", "static", "dynamic"} for entry in catalog)
+
+
+def test_admin_can_create_a_tag_directly(client, admin_headers, player_headers):
+    created = client.post(
+        "/api/v1/challenges/tags",
+        headers=admin_headers,
+        json={"name": "Stack Overflow", "description": "栈溢出与利用"},
+    )
+    assert created.status_code == 201
+    body = created.json()
+    assert body["name"] == "stack-overflow"
+    assert body["kind"] == "topic"
+    assert body["challenge_count"] == 0
+
+    duplicate = client.post(
+        "/api/v1/challenges/tags", headers=admin_headers, json={"name": "stack-overflow"}
+    )
+    assert duplicate.status_code == 409
+    reserved = client.post("/api/v1/challenges/tags", headers=admin_headers, json={"name": "dynamic"})
+    assert reserved.status_code == 422
+    empty = client.post("/api/v1/challenges/tags", headers=admin_headers, json={"name": "---"})
+    assert empty.status_code == 422
+    assert client.post(
+        "/api/v1/challenges/tags", headers=player_headers, json={"name": "cheat"}
+    ).status_code == 403
+
+    catalog = client.get("/api/v1/challenges/tags/catalog", headers=admin_headers).json()
+    assert "stack-overflow" in {entry["name"] for entry in catalog}
+
+    # the new tag can immediately be attached to a challenge
+    challenge = client.post(
+        "/api/v1/challenges",
+        headers=admin_headers,
+        json=_challenge_payload(slug="created-tag-target", tags=["stack-overflow"]),
+    ).json()
+    assert challenge["tags"] == ["stack-overflow", "static"]
+    assert client.get("/api/v1/challenges?tag=stack-overflow", headers=admin_headers).json()
 
 
 def test_tag_rename_and_delete(client, admin_headers):
@@ -191,11 +257,12 @@ def test_instance_exposes_reachable_address_and_commands(client, player_headers)
     started = client.post(f"/api/v1/instances/{challenge['id']}", headers=player_headers)
     assert started.status_code == 201
     body = started.json()
-    assert body["public_host"] == "testserver"
+    # the fixture binds instances to 127.0.0.1, so that is what players are told to use
+    assert body["public_host"] == "127.0.0.1"
     assert body["public_port"]
-    assert body["listen_address"] == f"testserver:{body['public_port']}"
-    assert body["access_url"] == f"http://testserver:{body['public_port']}"
-    assert body["connect_command"] == f"nc testserver {body['public_port']}"
+    assert body["listen_address"] == f"127.0.0.1:{body['public_port']}"
+    assert body["access_url"] == f"http://127.0.0.1:{body['public_port']}"
+    assert body["connect_command"] == f"nc 127.0.0.1 {body['public_port']}"
 
     fetched = client.get(f"/api/v1/instances/{body['id']}", headers=player_headers)
     assert fetched.status_code == 200
@@ -296,6 +363,46 @@ def test_script_interpreter_follows_the_shebang(tmp_path):
     assert DockerService._script_command(python, "/tmp/y") == ["python3", "/tmp/y"]
     assert script_interpreter(shell) == ["/bin/sh", "-n"]
     assert script_interpreter(python) == ["python3", "-m", "py_compile"]
+
+
+def test_start_does_not_widen_the_configured_bind(monkeypatch):
+    """The published address must not be broader than SYCL_INSTANCE_BIND_ADDRESS."""
+    from app.services.docker import DockerService
+
+    docker = DockerService(mode="cli")
+    commands: list[list[str]] = []
+
+    def fake_run(command, timeout):
+        commands.append(command)
+        return "cid123" if command[1] == "run" else "127.0.0.1:40000\n"
+
+    monkeypatch.setattr(docker, "_run", fake_run)
+    docker.start(
+        image="calc:1", internal_port=9999, name="sycl-test", user_id="u1", challenge_id="c1",
+        bind_address="10.0.0.5",
+    )
+    assert "10.0.0.5::9999" in commands[0]
+
+
+def test_instance_reports_the_address_it_is_published_on(client, player_headers):
+    """The reported host must match the bind address, otherwise the UI lies."""
+    from dataclasses import replace
+
+    from app.api.routes.instances import _effective_public_host
+
+    request = type("R", (), {"headers": {"host": "192.168.1.50:8080"}})()
+
+    class FakeSettings:
+        instance_public_host = "localhost"
+
+    loopback = replace(client.app.state.settings, instance_bind_address="127.0.0.1")
+    assert _effective_public_host(request, loopback) == "127.0.0.1"
+
+    wildcard = replace(client.app.state.settings, instance_bind_address="0.0.0.0")
+    assert _effective_public_host(request, wildcard) == "192.168.1.50"
+
+    concrete = replace(client.app.state.settings, instance_bind_address="10.0.0.5")
+    assert _effective_public_host(request, concrete) == "10.0.0.5"
 
 
 def test_build_registry_keeps_progress_and_final_output():
