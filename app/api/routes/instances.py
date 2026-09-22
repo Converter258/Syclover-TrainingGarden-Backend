@@ -14,6 +14,7 @@ from app.services.reaper import expire_instances
 
 router = APIRouter(prefix="/instances", tags=["instances"])
 logger = logging.getLogger("syclover.instances")
+MAX_ACTIVE_INSTANCES_PER_USER = 2
 
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
 
@@ -206,10 +207,20 @@ async def start_instance(
             "AND status IN ('starting', 'running')",
             (user["id"], challenge_id),
         ).fetchone()
+        active_count = connection.execute(
+            "SELECT COUNT(*) AS count FROM instances WHERE user_id = ? "
+            "AND status IN ('starting', 'running')",
+            (user["id"],),
+        ).fetchone()["count"]
     if not challenge or (challenge["status"] != "published" and user["role"] != "admin"):
         raise HTTPException(status_code=404, detail="Challenge not found")
     if existing:
         raise HTTPException(status_code=409, detail="An active instance already exists for this challenge")
+    if active_count >= MAX_ACTIVE_INSTANCES_PER_USER:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Each account can have at most {MAX_ACTIVE_INSTANCES_PER_USER} active environments",
+        )
     if not challenge["docker_image"] or not challenge["internal_port"]:
         raise HTTPException(status_code=409, detail="This challenge has no deployable Docker environment")
 

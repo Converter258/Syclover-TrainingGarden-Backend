@@ -75,6 +75,40 @@ def test_mock_instance_lifecycle(client, player_headers):
     assert client.get("/api/v1/instances", headers=player_headers).json()[0]["status"] == "stopped"
 
 
+def test_account_can_have_at_most_two_active_instances(client, admin_headers, player_headers):
+    seed = client.get("/api/v1/challenges", headers=player_headers).json()
+    source = next(item for item in seed if item["docker_image"] and item["internal_port"])
+    created = client.post(
+        "/api/v1/challenges",
+        headers=admin_headers,
+        json={
+            "title": "Third Environment Target",
+            "slug": "third-environment-target",
+            "description": "A third deployable target used to verify account limits.",
+            "category": "Web",
+            "mode": "ctf",
+            "difficulty": "easy",
+            "points": 100,
+            "docker_image": source["docker_image"],
+            "internal_port": source["internal_port"],
+            "flag": "SYC{third_environment}",
+            "status": "published",
+        },
+    )
+    assert created.status_code == 201
+    challenges = [
+        item for item in client.get("/api/v1/challenges", headers=player_headers).json()
+        if item["docker_image"] and item["internal_port"]
+    ]
+    assert len(challenges) >= 3
+    started = [
+        client.post(f"/api/v1/instances/{item['id']}", headers=player_headers)
+        for item in challenges[:3]
+    ]
+    assert [response.status_code for response in started] == [201, 201, 409]
+    assert "at most 2" in started[2].json()["detail"]
+
+
 def test_admin_challenge_and_attachment(client, admin_headers, player_headers):
     payload = {
         "title": "Crypto Orchard",
