@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 
 from app.api.deps import AdminUser, CurrentUser, DatabaseDep, DockerDep, SettingsDep
 from app.schemas import AssetPublic, DeploymentEventPublic
+from app.services.achievements import maybe_grant_peak_geek_2025
 from app.services.assets import safe_filename, store_bytes, validate_asset
 from app.services.docker import ContainerError
 
@@ -22,7 +23,7 @@ def _asset(row) -> AssetPublic:
 @router.get("/assets", response_model=list[AssetPublic])
 async def list_defense_assets(user: CurrentUser, database: DatabaseDep) -> list[AssetPublic]:
     with database.connect() as connection:
-        if user["role"] == "admin":
+        if user["role"] in {"admin", "root_admin"}:
             rows = connection.execute(
                 "SELECT * FROM assets WHERE kind = 'patch' ORDER BY created_at DESC"
             ).fetchall()
@@ -103,15 +104,17 @@ async def upload_defense_asset(
         raise HTTPException(status_code=413, detail="File is empty or exceeds the upload limit")
     with database.connect() as connection:
         challenge = connection.execute(
-            "SELECT mode, status FROM challenges WHERE id = ?", (challenge_id,)
+            "SELECT mode, category, status FROM challenges WHERE id = ?", (challenge_id,)
         ).fetchone()
     if not challenge or challenge["mode"] != "awdp" or (
-        challenge["status"] != "published" and user["role"] != "admin"
+        challenge["status"] != "published" and user["role"] not in {"admin", "root_admin"}
     ):
         raise HTTPException(status_code=404, detail="AWDP challenge not found")
 
+    if not filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=422, detail="Defense patch must be a patch.zip archive")
     stored_name, path = store_bytes(settings.storage_path, challenge_id, filename, content)
-    valid, output = validate_asset(path, "patch")
+    valid, output = validate_asset(path, "patch", category=challenge["category"])
     asset_id = str(uuid.uuid4())
     with database.connect() as connection:
         connection.execute(
@@ -150,7 +153,7 @@ async def deploy_defense_asset(
     with database.connect() as connection:
         instance = connection.execute(
             """
-            SELECT i.*, c.internal_port AS challenge_internal_port
+            SELECT i.*, c.internal_port AS challenge_internal_port, c.category AS challenge_category
             FROM instances i JOIN challenges c ON c.id = i.challenge_id
             WHERE i.id = ?
             """,
@@ -162,9 +165,9 @@ async def deploy_defense_asset(
             "AND validation_status = 'valid' ORDER BY created_at DESC LIMIT 1",
             (instance["challenge_id"],),
         ).fetchone() if instance else None
-    if not instance or (instance["user_id"] != user["id"] and user["role"] != "admin"):
+    if not instance or (instance["user_id"] != user["id"] and user["role"] not in {"admin", "root_admin"}):
         raise HTTPException(status_code=404, detail="Instance not found")
-    if not asset or (asset["user_id"] != user["id"] and user["role"] != "admin"):
+    if not asset or (asset["user_id"] != user["id"] and user["role"] not in {"admin", "root_admin"}):
         raise HTTPException(status_code=404, detail="Defense asset not found")
     if instance["challenge_id"] != asset["challenge_id"]:
         raise HTTPException(status_code=400, detail="Asset and instance belong to different challenges")
@@ -189,6 +192,7 @@ async def deploy_defense_asset(
             instance["container_id"],
             settings.storage_path / asset["stored_name"],
             asset["kind"],
+            category=instance["challenge_category"],
         )
         # A challenge entry point rebuilds from the patched source on start, so the
         # container is restarted before the Check runs: the verdict then describes the
@@ -234,6 +238,7 @@ async def deploy_defense_asset(
                 "(id, user_id, challenge_id, event_id, created_at) VALUES (?, ?, ?, ?, ?)",
                 (str(uuid.uuid4()), user["id"], instance["challenge_id"], event_id, created_at),
             )
+            maybe_grant_peak_geek_2025(connection, user["id"])
         row = connection.execute(
             "SELECT id, instance_id, asset_id, success, output, created_at FROM deployment_events WHERE id = ?",
             (event_id,),
@@ -249,7 +254,7 @@ async def list_deployment_events(
         instance = connection.execute(
             "SELECT user_id FROM instances WHERE id = ?", (instance_id,)
         ).fetchone()
-        if not instance or (instance["user_id"] != user["id"] and user["role"] != "admin"):
+        if not instance or (instance["user_id"] != user["id"] and user["role"] not in {"admin", "root_admin"}):
             raise HTTPException(status_code=404, detail="Instance not found")
         rows = connection.execute(
             "SELECT id, instance_id, asset_id, success, output, created_at FROM deployment_events "

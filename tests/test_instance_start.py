@@ -8,7 +8,7 @@ from app.core.seed import seed_database
 from app.api.routes.instances import _launch_instance
 from app.main import create_app
 from app.services.docker import ContainerError, ContainerState, DockerService, StartedContainer
-from tests.conftest import ASGITestClient, auth_header
+from tests.conftest import ASGITestClient, auth_header, seed_test_challenges
 
 
 def _async_settings(base: Settings) -> Settings:
@@ -22,6 +22,7 @@ def test_async_start_returns_starting_then_becomes_reachable(settings):
     database.initialize()
     seed_database(database, settings)
     settings.storage_path.mkdir(parents=True, exist_ok=True)
+    seed_test_challenges(database, settings)
     app.state.settings = resolved
     app.state.database = database
     app.state.docker = DockerService("mock")
@@ -58,6 +59,7 @@ def test_failed_background_start_is_recorded(settings):
     database.initialize()
     seed_database(database, settings)
     settings.storage_path.mkdir(parents=True, exist_ok=True)
+    seed_test_challenges(database, settings)
     app.state.settings = resolved
     app.state.database = database
     app.state.docker = BrokenDocker()

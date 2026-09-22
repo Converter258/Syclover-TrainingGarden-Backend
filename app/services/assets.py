@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import stat
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile
@@ -34,7 +35,91 @@ def script_interpreter(path: Path) -> list[str]:
     return ["/bin/sh", "-n"]
 
 
-def validate_asset(path: Path, kind: str) -> tuple[bool, str]:
+def _patch_entries(archive: Path, *, max_files: int = 2_000, max_uncompressed_bytes: int = 256 * 1024 * 1024):
+    try:
+        bundle = ZipFile(archive)
+    except (BadZipFile, OSError, RuntimeError) as exc:
+        raise ValueError("Patch file must be a valid ZIP archive") from exc
+    try:
+        entries = bundle.infolist()
+        if not entries or len(entries) > max_files:
+            raise ValueError("Patch archive is empty or contains too many files")
+        total_size = 0
+        files = []
+        seen_paths: set[str] = set()
+        for entry in entries:
+            if not entry.filename or "\\" in entry.filename:
+                raise ValueError("Patch archive contains an unsafe path")
+            path = PurePosixPath(entry.filename)
+            mode = entry.external_attr >> 16
+            if (
+                path == PurePosixPath(".")
+                or path.is_absolute()
+                or ".." in path.parts
+                or (path.parts and re.match(r"^[A-Za-z]:", path.parts[0]))
+            ):
+                raise ValueError("Patch archive contains an unsafe path")
+            if stat.S_ISLNK(mode):
+                raise ValueError("Patch archive cannot contain symbolic links")
+            normalized_name = path.as_posix()
+            if normalized_name in seen_paths:
+                raise ValueError("Patch archive contains duplicate paths")
+            seen_paths.add(normalized_name)
+            total_size += entry.file_size
+            if total_size > max_uncompressed_bytes:
+                raise ValueError("Patch archive expands beyond the allowed size")
+            if not entry.is_dir():
+                files.append(normalized_name)
+        if "fix.sh" not in files:
+            raise ValueError("Patch archive must contain a root-level fix.sh")
+        if any(name == "" for name in files):
+            raise ValueError("Patch archive contains an invalid file name")
+        return bundle, entries, files
+    except Exception:
+        bundle.close()
+        raise
+
+
+def extract_patch_archive(
+    archive: Path,
+    destination: Path,
+    *,
+    category: str | None = None,
+    max_files: int = 2_000,
+    max_uncompressed_bytes: int = 256 * 1024 * 1024,
+) -> list[str]:
+    """Validate and safely extract an AWDP patch bundle."""
+    bundle, entries, files = _patch_entries(
+        archive, max_files=max_files, max_uncompressed_bytes=max_uncompressed_bytes
+    )
+    try:
+        extras = [name for name in files if name != "fix.sh"]
+        if category == "Pwn" and len(extras) != 1:
+            raise ValueError("Pwn patch archive must contain fix.sh and exactly one binary file")
+        if category == "Web" and not extras:
+            raise ValueError("Web patch archive must contain fix.sh and the service files")
+        destination.mkdir(parents=True, exist_ok=True)
+        bundle.extractall(destination)
+    finally:
+        bundle.close()
+    fix_path = destination / "fix.sh"
+    valid, output = validate_asset(fix_path, "fix_script")
+    if not valid:
+        raise ValueError(f"fix.sh failed syntax validation: {output}")
+    return files
+
+
+def validate_patch_archive(path: Path, category: str | None = None) -> tuple[bool, str]:
+    try:
+        with tempfile.TemporaryDirectory(prefix="syclover-patch-") as directory:
+            files = extract_patch_archive(path, Path(directory), category=category)
+    except (ValueError, OSError) as exc:
+        return False, str(exc)
+    kind = f"{category} " if category else ""
+    return True, f"{kind}patch.zip is valid; contains: {', '.join(files)}"
+
+
+def validate_asset(path: Path, kind: str, *, category: str | None = None) -> tuple[bool, str]:
     if kind in {"check_script", "fix_script"}:
         command = script_interpreter(path)
         try:
@@ -54,9 +139,7 @@ def validate_asset(path: Path, kind: str) -> tuple[bool, str]:
             return True, f"Syntax is valid ({command[0]})."
         return False, output or "Script failed syntax validation."
     if kind == "patch":
-        text = path.read_text(encoding="utf-8", errors="replace")
-        valid = ("diff --git " in text) or ("--- " in text and "+++ " in text and "@@" in text)
-        return valid, "Unified diff structure detected." if valid else "Expected a unified diff patch."
+        return validate_patch_archive(path, category)
     return True, "Attachment is available."
 
 

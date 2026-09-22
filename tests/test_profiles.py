@@ -49,10 +49,7 @@ def test_admin_can_grant_core_badge_and_player_can_change_password(
     assert granted.json()["slug"] == "core_member"
 
     profile = client.get(f"/api/v1/users/{user_id}/profile", headers=player_headers)
-    assert {item["slug"] for item in profile.json()["achievements"]} == {
-        "sprout_member",
-        "core_member",
-    }
+    assert {item["slug"] for item in profile.json()["achievements"]} == {"core_member"}
 
     changed = client.post(
         "/api/v1/users/me/password",

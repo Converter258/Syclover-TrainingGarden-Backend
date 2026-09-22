@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, status
 
 from app.api.deps import CurrentUser, DatabaseDep, DockerDep, SettingsDep
 from app.schemas import InstancePublic, Message
@@ -56,7 +57,7 @@ def _serialize(row, user: dict | None = None, public_host: str | None = None) ->
         data["public_host"] = public_host
     if user is not None:
         data["mine"] = data.get("user_id") == user["id"]
-        data["is_admin"] = user["role"] == "admin"
+        data["is_admin"] = user["role"] in {"admin", "root_admin"}
     return InstancePublic.model_validate(data)
 
 
@@ -89,6 +90,16 @@ def _launch_instance(instance_id: str, public_host: str, launch: dict, database,
             logger.warning("Late container %s could not be reclaimed: %s", started.container_id, exc)
 
 
+def _launch_instance_in_background(
+    instance_id: str, public_host: str, launch: dict, database, docker
+) -> None:
+    """Run the blocking Docker start without making the HTTP response await it."""
+    try:
+        _launch_instance(instance_id, public_host, launch, database, docker)
+    except Exception:
+        logger.exception("Background start for instance %s failed unexpectedly", instance_id)
+
+
 def _reclaim(database, docker) -> None:
     """Reclaim expired instances before answering a request, for all users."""
     expire_instances(database, docker)
@@ -97,8 +108,8 @@ def _reclaim(database, docker) -> None:
 def _resync_ports(user: dict, database, docker, settings) -> None:
     """Refresh published ports when a container was restarted outside the platform."""
     with database.connect() as connection:
-        condition = "" if user["role"] == "admin" else "AND i.user_id = ?"
-        values = () if user["role"] == "admin" else (user["id"],)
+        condition = "" if user["role"] in {"admin", "root_admin"} else "AND i.user_id = ?"
+        values = () if user["role"] in {"admin", "root_admin"} else (user["id"],)
         rows = connection.execute(
             f"""
             SELECT i.id, i.container_id, i.public_port, c.internal_port
@@ -125,7 +136,7 @@ def _resync_ports(user: dict, database, docker, settings) -> None:
 def _reflect_dead_containers(user: dict, database, docker) -> None:
     """Mark instances whose container vanished without the platform stopping it."""
     with database.connect() as connection:
-        if user["role"] == "admin":
+        if user["role"] in {"admin", "root_admin"}:
             rows = connection.execute(
                 "SELECT id, container_id FROM instances WHERE status = 'running'"
             ).fetchall()
@@ -171,7 +182,7 @@ async def list_instances(
     _resync_ports(user, database, docker, settings)
     public_host = _effective_public_host(request, settings)
     with database.connect() as connection:
-        if user["role"] == "admin":
+        if user["role"] in {"admin", "root_admin"}:
             rows = connection.execute(
                 "SELECT i.*, c.title AS challenge_title FROM instances i "
                 "JOIN challenges c ON c.id = i.challenge_id ORDER BY i.created_at DESC"
@@ -194,7 +205,6 @@ async def start_instance(
     database: DatabaseDep,
     settings: SettingsDep,
     docker: DockerDep,
-    background: BackgroundTasks,
 ) -> InstancePublic:
     _reclaim(database, docker)
     _reflect_dead_containers(user, database, docker)
@@ -212,7 +222,7 @@ async def start_instance(
             "AND status IN ('starting', 'running')",
             (user["id"],),
         ).fetchone()["count"]
-    if not challenge or (challenge["status"] != "published" and user["role"] != "admin"):
+    if not challenge or (challenge["status"] != "published" and user["role"] not in {"admin", "root_admin"}):
         raise HTTPException(status_code=404, detail="Challenge not found")
     if existing:
         raise HTTPException(status_code=409, detail="An active instance already exists for this challenge")
@@ -284,7 +294,12 @@ async def start_instance(
     if settings.instance_start_async:
         # Answer immediately so the UI can show live startup progress instead of
         # holding one HTTP request open for the whole container start.
-        background.add_task(_launch_instance, instance_id, public_host, launch, database, docker)
+        threading.Thread(
+            target=_launch_instance_in_background,
+            args=(instance_id, public_host, launch, database, docker),
+            name=f"instance-start-{instance_id}",
+            daemon=True,
+        ).start()
         with database.connect() as connection:
             row = connection.execute(
                 "SELECT i.*, c.title AS challenge_title FROM instances i "
@@ -335,7 +350,7 @@ async def get_instance(
             "WHERE i.id = ?",
             (instance_id,),
         ).fetchone()
-    if not row or (row["user_id"] != user["id"] and user["role"] != "admin"):
+    if not row or (row["user_id"] != user["id"] and user["role"] not in {"admin", "root_admin"}):
         raise HTTPException(status_code=404, detail="Instance not found")
     return _serialize(row, user, _effective_public_host(request, settings))
 
@@ -346,7 +361,7 @@ async def stop_instance(
 ) -> Message:
     with database.connect() as connection:
         row = connection.execute("SELECT * FROM instances WHERE id = ?", (instance_id,)).fetchone()
-    if not row or (row["user_id"] != user["id"] and user["role"] != "admin"):
+    if not row or (row["user_id"] != user["id"] and user["role"] not in {"admin", "root_admin"}):
         raise HTTPException(status_code=404, detail="Instance not found")
     if row["status"] in {"stopped", "failed"}:
         return Message(message="Instance is already stopped")

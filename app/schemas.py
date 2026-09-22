@@ -24,7 +24,7 @@ class Message(BaseModel):
 class UserPublic(BaseModel):
     id: str
     username: str
-    role: Literal["player", "admin"]
+    role: Literal["player", "admin", "root_admin"]
     is_active: bool
     avatar_url: str | None = None
     signature: str | None = None
@@ -69,6 +69,7 @@ class AchievementPublic(BaseModel):
     slug: str
     name: str
     description: str
+    acquisition: str
     icon: str
     awarded_at: datetime | None = None
 

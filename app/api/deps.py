@@ -47,13 +47,20 @@ async def current_user(
 
 
 async def admin_user(user: Annotated[dict, Depends(current_user)]) -> dict:
-    if user["role"] != "admin":
+    if user["role"] not in {"admin", "root_admin"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Administrator role required")
+    return user
+
+
+async def root_admin_user(user: Annotated[dict, Depends(current_user)]) -> dict:
+    if user["role"] != "root_admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Root administrator role required")
     return user
 
 
 CurrentUser = Annotated[dict, Depends(current_user)]
 AdminUser = Annotated[dict, Depends(admin_user)]
+RootAdminUser = Annotated[dict, Depends(root_admin_user)]
 DatabaseDep = Annotated[Database, Depends(get_database)]
 SettingsDep = Annotated[Settings, Depends(get_settings_dependency)]
 DockerDep = Annotated[object, Depends(get_docker_service)]

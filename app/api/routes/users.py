@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from app.api.deps import AdminUser, CurrentUser, DatabaseDep, DockerDep, SettingsDep
+from app.api.deps import CurrentUser, DatabaseDep, DockerDep, RootAdminUser, SettingsDep
 from app.core.security import hash_password, verify_password
 from app.schemas import (
     AchievementPublic,
@@ -13,7 +13,7 @@ from app.schemas import (
     UserPublic,
     UserUpdate,
 )
-from app.services.achievements import user_achievement_slugs, user_achievements
+from app.services.achievements import grant_achievement, user_achievement_slugs, user_achievements
 from app.services.docker import ContainerError
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -70,7 +70,7 @@ def _profile(connection, user_id: str) -> UserProfile | None:
 
 
 @router.get("", response_model=list[UserPublic])
-async def list_users(_: AdminUser, database: DatabaseDep) -> list[UserPublic]:
+async def list_users(_: RootAdminUser, database: DatabaseDep) -> list[UserPublic]:
     with database.connect() as connection:
         rows = connection.execute(
             "SELECT id, username, role, is_active, avatar_url, signature, direction, created_at "
@@ -83,7 +83,7 @@ async def list_users(_: AdminUser, database: DatabaseDep) -> list[UserPublic]:
 async def list_achievements(_: CurrentUser, database: DatabaseDep) -> list[AchievementPublic]:
     with database.connect() as connection:
         rows = connection.execute(
-            "SELECT slug, name, description, icon FROM achievements ORDER BY created_at, slug"
+            "SELECT slug, name, description, acquisition, icon FROM achievements ORDER BY created_at, slug"
         ).fetchall()
     return [AchievementPublic.model_validate(dict(row)) for row in rows]
 
@@ -138,7 +138,7 @@ async def change_password(
 
 
 @router.patch("/{user_id}", response_model=UserPublic)
-async def update_user(user_id: str, payload: UserUpdate, admin: AdminUser, database: DatabaseDep) -> UserPublic:
+async def update_user(user_id: str, payload: UserUpdate, admin: RootAdminUser, database: DatabaseDep) -> UserPublic:
     if admin["id"] == user_id and payload.is_active is False:
         raise HTTPException(status_code=400, detail="You cannot disable your own account")
     fields = payload.model_dump(exclude_unset=True)
@@ -147,6 +147,9 @@ async def update_user(user_id: str, payload: UserUpdate, admin: AdminUser, datab
     assignments = ", ".join(f"{key} = ?" for key in fields)
     values = [int(value) if isinstance(value, bool) else value for value in fields.values()]
     with database.connect() as connection:
+        target = connection.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+        if target and target["role"] == "root_admin":
+            raise HTTPException(status_code=400, detail="Root administrator accounts are fixed")
         cursor = connection.execute(
             f"UPDATE users SET {assignments} WHERE id = ?", (*values, user_id)
         )
@@ -164,25 +167,21 @@ async def update_user(user_id: str, payload: UserUpdate, admin: AdminUser, datab
 async def grant_user_achievement(
     user_id: str,
     achievement_slug: str,
-    admin: AdminUser,
+    admin: RootAdminUser,
     database: DatabaseDep,
 ) -> AchievementPublic:
     with database.connect() as connection:
         if not connection.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
             raise HTTPException(status_code=404, detail="User not found")
         achievement = connection.execute(
-            "SELECT slug, name, description, icon FROM achievements WHERE slug = ?",
+            "SELECT slug, name, description, acquisition, icon FROM achievements WHERE slug = ?",
             (achievement_slug,),
         ).fetchone()
         if not achievement:
             raise HTTPException(status_code=404, detail="Achievement not found")
-        connection.execute(
-            "INSERT OR IGNORE INTO user_achievements "
-            "(user_id, achievement_slug, awarded_at, awarded_by) VALUES (?, ?, datetime('now'), ?)",
-            (user_id, achievement_slug, admin["id"]),
-        )
+        grant_achievement(connection, user_id, achievement_slug, admin["id"])
         awarded = connection.execute(
-            "SELECT a.slug, a.name, a.description, a.icon, ua.awarded_at "
+            "SELECT a.slug, a.name, a.description, a.acquisition, a.icon, ua.awarded_at "
             "FROM achievements a JOIN user_achievements ua ON ua.achievement_slug = a.slug "
             "WHERE ua.user_id = ? AND a.slug = ?",
             (user_id, achievement_slug),
@@ -202,7 +201,7 @@ async def user_profile(user_id: str, _: CurrentUser, database: DatabaseDep) -> U
 @router.delete("/{user_id}", response_model=Message)
 async def delete_user(
     user_id: str,
-    admin: AdminUser,
+    admin: RootAdminUser,
     database: DatabaseDep,
     settings: SettingsDep,
     docker: DockerDep,

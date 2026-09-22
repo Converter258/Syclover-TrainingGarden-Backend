@@ -5,9 +5,13 @@ import ipaddress
 import json
 import re
 import subprocess
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+from app.services.assets import extract_patch_archive
 
 IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 CONTAINER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -460,26 +464,40 @@ class DockerService:
         """Compatibility helper: whether the container object exists in Docker."""
         return self.container_state(container_id) is not None
 
-    def apply_asset(self, container_id: str, path: Path, kind: str) -> str:
+    def apply_asset(
+        self, container_id: str, path: Path, kind: str, *, category: str | None = None
+    ) -> str:
         if not CONTAINER_PATTERN.fullmatch(container_id):
             raise ContainerError("Unsafe container identifier")
         if self.mode == "mock":
             return f"Mock mode: {kind} {path.name} accepted for {container_id}."
-        target = f"/tmp/syclover-{path.name}"
-        self._run(["docker", "cp", str(path), f"{container_id}:{target}"], timeout=20)
         if kind in {"check_script", "fix_script"}:
+            target = f"/tmp/syclover-{path.name}"
+            self._run(["docker", "cp", str(path), f"{container_id}:{target}"], timeout=20)
             # The interpreter is decided from the host-side file: the container path only
             # exists inside the challenge container.
             command = ["docker", "exec", container_id, *self._script_command(path, target)]
         elif kind == "patch":
-            command = [
-                "docker",
-                "exec",
-                container_id,
-                "/bin/sh",
-                "-c",
-                f"cd /app && patch -p1 < {target}",
-            ]
+            bundle_id = uuid.uuid4().hex
+            with tempfile.TemporaryDirectory(prefix="syclover-patch-") as directory:
+                try:
+                    extract_patch_archive(path, Path(directory), category=category)
+                except (ValueError, OSError) as exc:
+                    raise ContainerError(str(exc)) from exc
+                target = f"/tmp/syclover-patch-{bundle_id}"
+                self._run(["docker", "cp", f"{directory}/.", f"{container_id}:{target}"], timeout=20)
+                command = [
+                    "docker",
+                    "exec",
+                    container_id,
+                    "/bin/sh",
+                    "-c",
+                    (
+                        f"set -eu; trap 'rm -rf {target}' EXIT; "
+                        f"cp -a {target}/. /app/; cd /app; /bin/sh /app/fix.sh"
+                    ),
+                ]
+                return self._run(command, timeout=60)
         else:
             raise ContainerError("Only patches and fix scripts can be applied")
         return self._run(command, timeout=30)
