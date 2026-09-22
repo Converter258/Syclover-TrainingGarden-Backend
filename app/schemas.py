@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.services.flags import template_wants_random
+from app.services.invites import MAX_CODES_PER_REQUEST
 
 CTF_CATEGORIES = ("Web", "Pwn", "Reverse", "Misc", "Crypto")
 AWDP_CATEGORIES = ("Web", "Pwn")
@@ -36,6 +37,30 @@ class UserPublic(BaseModel):
 class RegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_-]+$")
     password: str = Field(min_length=8, max_length=128)
+    invite_code: str = Field(min_length=4, max_length=64)
+
+
+class InviteCodePublic(BaseModel):
+    id: str
+    code: str
+    note: str | None = None
+    status: Literal["unused", "used"]
+    created_by: str | None = None
+    created_by_username: str | None = None
+    used_by: str | None = None
+    used_by_username: str | None = None
+    created_at: datetime
+    used_at: datetime | None = None
+
+
+class InviteCodeCreate(BaseModel):
+    count: int = Field(default=1, ge=1, le=MAX_CODES_PER_REQUEST)
+    note: str | None = Field(default=None, max_length=120)
+
+    @field_validator("note")
+    @classmethod
+    def normalize_note(cls, value: str | None) -> str | None:
+        return value.strip() if value and value.strip() else None
 
 
 class LoginRequest(BaseModel):
