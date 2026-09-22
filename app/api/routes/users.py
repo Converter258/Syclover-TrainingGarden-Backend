@@ -2,26 +2,139 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from app.api.deps import AdminUser, DatabaseDep, DockerDep, SettingsDep
-from app.schemas import Message, UserPublic, UserUpdate
+from app.api.deps import AdminUser, CurrentUser, DatabaseDep, DockerDep, SettingsDep
+from app.core.security import hash_password, verify_password
+from app.schemas import (
+    AchievementPublic,
+    Message,
+    PasswordChange,
+    ProfileUpdate,
+    UserProfile,
+    UserPublic,
+    UserUpdate,
+)
+from app.services.achievements import user_achievement_slugs, user_achievements
 from app.services.docker import ContainerError
 
 router = APIRouter(prefix="/users", tags=["users"])
 
 
-def _serialize(row) -> UserPublic:
+def _serialize(row, connection=None) -> UserPublic:
     data = dict(row)
     data["is_active"] = bool(data["is_active"])
+    if connection is not None:
+        data["achievement_slugs"] = user_achievement_slugs(connection, data["id"])
     return UserPublic.model_validate(data)
+
+
+def _profile(connection, user_id: str) -> UserProfile | None:
+    row = connection.execute(
+        "SELECT id, username, role, is_active, avatar_url, signature, direction, created_at "
+        "FROM users WHERE id = ?",
+        (user_id,),
+    ).fetchone()
+    if not row:
+        return None
+    stats = connection.execute(
+        """
+        SELECT COALESCE(SUM(CASE WHEN correct = 1 AND awarded_points > 0 THEN awarded_points ELSE 0 END), 0) AS score,
+               COUNT(CASE WHEN correct = 1 AND awarded_points > 0 THEN 1 END) AS solves
+        FROM submissions WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+    rank = None
+    if row["role"] == "player" and row["is_active"]:
+        ranked = connection.execute(
+            """
+            SELECT u.id, COALESCE(SUM(CASE WHEN s.correct = 1 AND s.awarded_points > 0
+                THEN s.awarded_points ELSE 0 END), 0) AS score,
+                MAX(CASE WHEN s.correct = 1 AND s.awarded_points > 0 THEN s.created_at END) AS last_solve_at,
+                u.created_at
+            FROM users u
+            LEFT JOIN submissions s ON s.user_id = u.id
+            WHERE u.role = 'player' AND u.is_active = 1
+            GROUP BY u.id
+            ORDER BY score DESC, last_solve_at ASC, u.created_at ASC
+            """
+        ).fetchall()
+        rank = next((index for index, item in enumerate(ranked, start=1) if item["id"] == user_id), None)
+    data = dict(row)
+    data["is_active"] = bool(data["is_active"])
+    data["achievement_slugs"] = user_achievement_slugs(connection, user_id)
+    data["score"] = int(stats["score"] or 0)
+    data["solves"] = int(stats["solves"] or 0)
+    data["rank"] = rank
+    data["achievements"] = user_achievements(connection, user_id)
+    return UserProfile.model_validate(data)
 
 
 @router.get("", response_model=list[UserPublic])
 async def list_users(_: AdminUser, database: DatabaseDep) -> list[UserPublic]:
     with database.connect() as connection:
         rows = connection.execute(
-            "SELECT id, username, role, is_active, created_at FROM users ORDER BY created_at DESC"
+            "SELECT id, username, role, is_active, avatar_url, signature, direction, created_at "
+            "FROM users ORDER BY created_at DESC"
         ).fetchall()
-    return [_serialize(row) for row in rows]
+        return [_serialize(row, connection) for row in rows]
+
+
+@router.get("/achievements/catalog", response_model=list[AchievementPublic])
+async def list_achievements(_: CurrentUser, database: DatabaseDep) -> list[AchievementPublic]:
+    with database.connect() as connection:
+        rows = connection.execute(
+            "SELECT slug, name, description, icon FROM achievements ORDER BY created_at, slug"
+        ).fetchall()
+    return [AchievementPublic.model_validate(dict(row)) for row in rows]
+
+
+@router.get("/me/profile", response_model=UserProfile)
+async def my_profile(user: CurrentUser, database: DatabaseDep) -> UserProfile:
+    with database.connect() as connection:
+        profile = _profile(connection, user["id"])
+    if profile is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return profile
+
+
+@router.patch("/me/profile", response_model=UserProfile)
+async def update_profile(
+    payload: ProfileUpdate,
+    user: CurrentUser,
+    database: DatabaseDep,
+) -> UserProfile:
+    fields = payload.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No changes supplied")
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    with database.connect() as connection:
+        connection.execute(
+            f"UPDATE users SET {assignments} WHERE id = ?",
+            (*fields.values(), user["id"]),
+        )
+        profile = _profile(connection, user["id"])
+    if profile is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return profile
+
+
+@router.post("/me/password", response_model=Message)
+async def change_password(
+    payload: PasswordChange,
+    user: CurrentUser,
+    database: DatabaseDep,
+) -> Message:
+    with database.connect() as connection:
+        row = connection.execute("SELECT password_hash FROM users WHERE id = ?", (user["id"],)).fetchone()
+        if not row or not verify_password(payload.current_password, row["password_hash"]):
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
+        if payload.current_password == payload.new_password:
+            raise HTTPException(status_code=400, detail="New password must be different")
+        connection.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(payload.new_password), user["id"]),
+        )
+    return Message(message="Password updated")
 
 
 @router.patch("/{user_id}", response_model=UserPublic)
@@ -40,9 +153,50 @@ async def update_user(user_id: str, payload: UserUpdate, admin: AdminUser, datab
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="User not found")
         row = connection.execute(
-            "SELECT id, username, role, is_active, created_at FROM users WHERE id = ?", (user_id,)
+            "SELECT id, username, role, is_active, avatar_url, signature, direction, created_at "
+            "FROM users WHERE id = ?",
+            (user_id,),
         ).fetchone()
-    return _serialize(row)
+        return _serialize(row, connection)
+
+
+@router.post("/{user_id}/achievements/{achievement_slug}", response_model=AchievementPublic)
+async def grant_user_achievement(
+    user_id: str,
+    achievement_slug: str,
+    admin: AdminUser,
+    database: DatabaseDep,
+) -> AchievementPublic:
+    with database.connect() as connection:
+        if not connection.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+        achievement = connection.execute(
+            "SELECT slug, name, description, icon FROM achievements WHERE slug = ?",
+            (achievement_slug,),
+        ).fetchone()
+        if not achievement:
+            raise HTTPException(status_code=404, detail="Achievement not found")
+        connection.execute(
+            "INSERT OR IGNORE INTO user_achievements "
+            "(user_id, achievement_slug, awarded_at, awarded_by) VALUES (?, ?, datetime('now'), ?)",
+            (user_id, achievement_slug, admin["id"]),
+        )
+        awarded = connection.execute(
+            "SELECT a.slug, a.name, a.description, a.icon, ua.awarded_at "
+            "FROM achievements a JOIN user_achievements ua ON ua.achievement_slug = a.slug "
+            "WHERE ua.user_id = ? AND a.slug = ?",
+            (user_id, achievement_slug),
+        ).fetchone()
+    return AchievementPublic.model_validate(dict(awarded))
+
+
+@router.get("/{user_id}/profile", response_model=UserProfile)
+async def user_profile(user_id: str, _: CurrentUser, database: DatabaseDep) -> UserProfile:
+    with database.connect() as connection:
+        profile = _profile(connection, user_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    return profile
 
 
 @router.delete("/{user_id}", response_model=Message)

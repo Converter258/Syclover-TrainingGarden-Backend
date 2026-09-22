@@ -9,6 +9,7 @@ from app.services.flags import template_wants_random
 
 CTF_CATEGORIES = ("Web", "Pwn", "Reverse", "Misc", "Crypto")
 AWDP_CATEGORIES = ("Web", "Pwn")
+USER_DIRECTIONS = CTF_CATEGORIES
 
 
 def category_is_valid(mode: str, category: str) -> bool:
@@ -25,7 +26,11 @@ class UserPublic(BaseModel):
     username: str
     role: Literal["player", "admin"]
     is_active: bool
+    avatar_url: str | None = None
+    signature: str | None = None
+    direction: Literal["Web", "Pwn", "Reverse", "Crypto", "Misc"] | None = None
     created_at: datetime
+    achievement_slugs: list[str] = Field(default_factory=list)
 
 
 class RegisterRequest(BaseModel):
@@ -47,6 +52,32 @@ class TokenResponse(BaseModel):
 class UserUpdate(BaseModel):
     role: Literal["player", "admin"] | None = None
     is_active: bool | None = None
+
+
+class ProfileUpdate(BaseModel):
+    avatar_url: str | None = Field(default=None, max_length=500)
+    signature: str | None = Field(default=None, max_length=160)
+    direction: Literal["Web", "Pwn", "Reverse", "Crypto", "Misc"] | None = None
+
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class AchievementPublic(BaseModel):
+    slug: str
+    name: str
+    description: str
+    icon: str
+    awarded_at: datetime | None = None
+
+
+class UserProfile(UserPublic):
+    score: int = 0
+    solves: int = 0
+    rank: int | None = None
+    achievements: list[AchievementPublic] = Field(default_factory=list)
 
 
 class ChallengeCreate(BaseModel):

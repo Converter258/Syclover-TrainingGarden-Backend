@@ -1,10 +1,12 @@
 # Syclover Training Garden Backend
 
-当前版本：**Alpha0.0.4-hotfix.1**。每个账号最多同时运行 2 个题目环境；停止或过期后可继续启动。
+当前版本：**Alpha0.0.5**。每个账号最多同时运行 2 个题目环境；停止或过期后可继续启动。
 
-版本：**Alpha0.0.3-hotfix.2**
+版本：**Alpha0.0.5**
 
 FastAPI + SQLite 实现的训练平台 API，包含认证与权限、独立 CTF/AWDP 题库、ZIP 即时镜像构建、Docker 实例、Flag 计分、攻防独立血榜、Markdown Hints、附件、AWDP Check/Fix/Patch 工作流、后台实例回收和独立排行榜。
+
+默认不会创建演示题目。只有显式设置 `SYCL_SEED_DEMO=true` 时才会写入测试用演示题；生产部署可直接创建自己的题库。Alpha0.0.5 还提供个人资料、方向、成就徽章和密码修改接口。
 
 ```bash
 python -m venv .venv

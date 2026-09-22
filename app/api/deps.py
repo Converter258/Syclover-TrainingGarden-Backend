@@ -37,7 +37,8 @@ async def current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
     with database.connect() as connection:
         row = connection.execute(
-            "SELECT id, username, role, is_active, created_at FROM users WHERE id = ?",
+            "SELECT id, username, role, is_active, avatar_url, signature, direction, created_at "
+            "FROM users WHERE id = ?",
             (payload["sub"],),
         ).fetchone()
     if not row or not row["is_active"]:

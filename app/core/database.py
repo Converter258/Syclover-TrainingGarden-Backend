@@ -16,8 +16,29 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     role TEXT NOT NULL DEFAULT 'player' CHECK (role IN ('player', 'admin')),
     is_active INTEGER NOT NULL DEFAULT 1,
+    avatar_url TEXT,
+    signature TEXT,
+    direction TEXT CHECK (direction IN ('Web', 'Pwn', 'Reverse', 'Crypto', 'Misc')),
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS achievements (
+    slug TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    icon TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_achievements (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    achievement_slug TEXT NOT NULL REFERENCES achievements(slug) ON DELETE CASCADE,
+    awarded_at TEXT NOT NULL,
+    awarded_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    PRIMARY KEY (user_id, achievement_slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_achievements_user ON user_achievements(user_id);
 
 CREATE TABLE IF NOT EXISTS challenges (
     id TEXT PRIMARY KEY,
@@ -146,6 +167,11 @@ DEFAULT_TAGS = (
     ("misc", "topic", "杂项与综合", 50),
 )
 
+ACHIEVEMENT_DEFINITIONS = (
+    ("sprout_member", "新芽组成员", "完成注册，加入 Syclover Training Garden。", "sprout"),
+    ("core_member", "核心组成员", "由管理员授予的核心组成员徽章。", "core"),
+)
+
 
 class Database:
     def __init__(self, path: Path):
@@ -156,8 +182,40 @@ class Database:
         self._migrate_legacy_constraints()
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+        self._migrate_user_profile()
         self._migrate_flags()
         self._seed_tags()
+        self._seed_achievements()
+
+    def _migrate_user_profile(self) -> None:
+        """Add profile fields to databases created before Alpha0.0.5."""
+        with self.connect() as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "avatar_url" not in columns:
+                connection.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT")
+            if "signature" not in columns:
+                connection.execute("ALTER TABLE users ADD COLUMN signature TEXT")
+            if "direction" not in columns:
+                connection.execute("ALTER TABLE users ADD COLUMN direction TEXT")
+
+    def _seed_achievements(self) -> None:
+        """Keep the built-in achievement catalog and registration badge available."""
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as connection:
+            for slug, name, description, icon in ACHIEVEMENT_DEFINITIONS:
+                connection.execute(
+                    "INSERT OR IGNORE INTO achievements "
+                    "(slug, name, description, icon, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (slug, name, description, icon, now),
+                )
+            user_rows = connection.execute("SELECT id FROM users").fetchall()
+            connection.executemany(
+                "INSERT OR IGNORE INTO user_achievements "
+                "(user_id, achievement_slug, awarded_at) VALUES (?, 'sprout_member', ?)",
+                [(row["id"], now) for row in user_rows],
+            )
 
     def _migrate_flags(self) -> None:
         """Convert Alpha0.0.2 ``<RANDOM>`` templates to the RAND token used since 0.0.3.
