@@ -339,7 +339,7 @@ async def build_challenge_image(
             (now, challenge_id),
         )
 
-    image = f"syclover/training-garden-{challenge['slug']}:alpha0.0.4"
+    image = f"syclover/training-garden-{challenge['slug']}:alpha0.0.3-hotfix.2"
     registry.start(challenge_id)
     registry.append(
         challenge_id,

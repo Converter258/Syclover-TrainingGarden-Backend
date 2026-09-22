@@ -87,12 +87,12 @@ def auth_header(client: ASGITestClient, username: str = "player", password: str 
 
 
 @pytest.fixture()
-def player_headers(client: TestClient):
+def player_headers(client: ASGITestClient):
     return auth_header(client)
 
 
 @pytest.fixture()
-def admin_headers(client: TestClient):
+def admin_headers(client: ASGITestClient):
     response = client.post("/api/v1/auth/login", json={"username": "admin", "password": "AdminPass123!"})
     assert response.status_code == 200
     return {"Authorization": f"Bearer {response.json()['access_token']}"}

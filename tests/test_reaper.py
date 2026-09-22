@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from app.core.database import Database
-from app.services.docker import ContainerError, DockerService
+from app.services.docker import ContainerError, ContainerState, DockerService
 from app.services.reaper import expire_instances, prune_orphan_containers, sweep
 
 
@@ -154,11 +154,14 @@ def test_docker_start_rejects_non_ip_bind_address(monkeypatch):
 def test_docker_start_uses_configured_bind_address_and_range(monkeypatch, tmp_path):
     docker = DockerService(mode="cli")
     commands: list[list[str]] = []
+    monkeypatch.setattr("app.services.docker.time.sleep", lambda _: None)
 
     def fake_run(command, timeout):
         commands.append(command)
         if command[1] == "run":
             return "cid123"
+        if command[1] == "inspect":
+            return '{"Status":"running","Running":true,"Restarting":false,"ExitCode":0}'
         return "0.0.0.0:32000\n"
 
     monkeypatch.setattr(docker, "_run", fake_run)
@@ -180,12 +183,15 @@ def test_docker_start_uses_configured_bind_address_and_range(monkeypatch, tmp_pa
 def test_docker_start_rejects_port_outside_configured_range(monkeypatch):
     docker = DockerService(mode="cli")
     stopped: list[str] = []
+    monkeypatch.setattr("app.services.docker.time.sleep", lambda _: None)
 
     def fake_run(command, timeout):
         if command[1] == "run":
             return "cid123"
         if command[1] == "port":
             return "0.0.0.0:41000\n"
+        if command[1] == "inspect":
+            return '{"Status":"running","Running":true,"Restarting":false,"ExitCode":0}'
         stopped.append(command[-1])
         return ""
 
@@ -200,6 +206,106 @@ def test_docker_start_rejects_port_outside_configured_range(monkeypatch):
             port_range=range(32000, 32100),
         )
     assert stopped == ["cid123"]
+
+
+def test_container_state_distinguishes_running_exited_and_missing(monkeypatch):
+    docker = DockerService(mode="cli")
+
+    def fake_run(command, timeout):
+        container_id = command[-1]
+        if container_id == "running123":
+            return (
+                '{"Status":"running","Running":true,"Restarting":false,'
+                '"ExitCode":0,"OOMKilled":false,"Error":""}'
+            )
+        if container_id == "exited123":
+            return (
+                '{"Status":"exited","Running":false,"Restarting":false,'
+                '"ExitCode":137,"OOMKilled":true,"Error":""}'
+            )
+        raise ContainerError(f"Error: No such object: {container_id}")
+
+    monkeypatch.setattr(docker, "_run", fake_run)
+
+    running = docker.container_state("running123")
+    exited = docker.container_state("exited123")
+    assert running is not None and running.active
+    assert exited == ContainerState("exited", False, False, 137, True, "")
+    assert docker.container_state("missing123") is None
+    assert "exit code: 137" in docker.failure_message(exited)
+    assert "OOM" in docker.failure_message(exited)
+
+
+def test_container_state_does_not_hide_daemon_errors(monkeypatch):
+    docker = DockerService(mode="cli")
+    monkeypatch.setattr(
+        docker,
+        "_run",
+        lambda command, timeout: (_ for _ in ()).throw(ContainerError("daemon unavailable")),
+    )
+
+    with pytest.raises(ContainerError, match="daemon unavailable"):
+        docker.container_state("container123")
+
+
+def test_start_rejects_a_container_that_exits_after_publishing_its_port(monkeypatch):
+    docker = DockerService(mode="cli")
+    stopped: list[str] = []
+
+    def fake_run(command, timeout):
+        if command[1] == "run":
+            return "cid123"
+        if command[1] == "port":
+            return "127.0.0.1:32000\n"
+        if command[1] == "inspect":
+            return (
+                '{"Status":"exited","Running":false,"Restarting":false,'
+                '"ExitCode":2,"OOMKilled":false,"Error":"bad command"}'
+            )
+        if command[1] == "logs":
+            return "application crashed"
+        if command[1] == "rm":
+            stopped.append(command[-1])
+        return ""
+
+    monkeypatch.setattr(docker, "_run", fake_run)
+
+    with pytest.raises(ContainerError, match="exit code: 2"):
+        docker.start(
+            image="calc:1",
+            internal_port=9999,
+            name="sycl-test",
+            user_id="u1",
+            challenge_id="c1",
+        )
+    assert stopped == ["cid123"]
+
+
+def test_start_rejects_a_container_that_entered_a_restart_loop(monkeypatch):
+    docker = DockerService(mode="cli")
+
+    def fake_run(command, timeout):
+        if command[1] == "run":
+            return "cid123"
+        if command[1] == "port":
+            return "127.0.0.1:32000\n"
+        if command[1] == "inspect":
+            return (
+                '{"Status":"running","Running":true,"Restarting":false,'
+                '"ExitCode":0,"OOMKilled":false,"Error":""}\t3'
+            )
+        return ""
+
+    monkeypatch.setattr(docker, "_run", fake_run)
+
+    with pytest.raises(ContainerError, match="restart count: 3"):
+        docker.start(
+            image="calc:1",
+            internal_port=9999,
+            name="sycl-test",
+            user_id="u1",
+            challenge_id="c1",
+        )
 
 
 def test_settings_parse_bind_address_range_and_reaper(monkeypatch):

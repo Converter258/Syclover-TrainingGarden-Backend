@@ -105,11 +105,12 @@ def test_deleting_a_challenge_removes_the_image_it_built(client, admin_headers, 
             "/api/v1/challenges",
             headers=admin_headers,
             json=_challenge_payload(
-                slug="image-cleanup", docker_image="syclover/training-garden-image-cleanup:alpha0.0.4"
+                slug="image-cleanup",
+                docker_image="syclover/training-garden-image-cleanup:alpha0.0.3-hotfix.2",
             ),
         ).json()
         assert client.delete(f"/api/v1/challenges/{created['id']}", headers=admin_headers).status_code == 200
-        assert removed == ["syclover/training-garden-image-cleanup:alpha0.0.4"]
+        assert removed == ["syclover/training-garden-image-cleanup:alpha0.0.3-hotfix.2"]
     finally:
         app.dependency_overrides.pop(get_docker_service, None)
 
@@ -371,10 +372,15 @@ def test_start_does_not_widen_the_configured_bind(monkeypatch):
 
     docker = DockerService(mode="cli")
     commands: list[list[str]] = []
+    monkeypatch.setattr("app.services.docker.time.sleep", lambda _: None)
 
     def fake_run(command, timeout):
         commands.append(command)
-        return "cid123" if command[1] == "run" else "127.0.0.1:40000\n"
+        if command[1] == "run":
+            return "cid123"
+        if command[1] == "inspect":
+            return '{"Status":"running","Running":true,"Restarting":false,"ExitCode":0}'
+        return "127.0.0.1:40000\n"
 
     monkeypatch.setattr(docker, "_run", fake_run)
     docker.start(

@@ -73,11 +73,19 @@ def _launch_instance(instance_id: str, public_host: str, launch: dict, database,
             )
         return
     with database.connect() as connection:
-        connection.execute(
+        updated = connection.execute(
             "UPDATE instances SET container_id = ?, public_host = ?, public_port = ?, status = 'running' "
             "WHERE id = ? AND status = 'starting'",
             (started.container_id, public_host, started.public_port, instance_id),
         )
+    if updated.rowcount == 0:
+        # The user may stop the pending instance, or an administrator may delete its
+        # challenge, while ``docker run`` is still pulling/starting. Do not leave the
+        # late container alive without a database row for the next reaper pass to find.
+        try:
+            docker.stop(started.container_id)
+        except ContainerError as exc:
+            logger.warning("Late container %s could not be reclaimed: %s", started.container_id, exc)
 
 
 def _reclaim(database, docker) -> None:
@@ -126,14 +134,26 @@ def _reflect_dead_containers(user: dict, database, docker) -> None:
                 (user["id"],),
             ).fetchall()
     for row in rows:
-        if not row["container_id"] or docker.container_exists(row["container_id"]):
+        if not row["container_id"]:
             continue
+        try:
+            state = docker.container_state(row["container_id"])
+        except ContainerError as exc:
+            # A busy or temporarily unavailable daemon says nothing about the container.
+            # Preserve the running record and retry on the next poll instead of fabricating
+            # an unexpected-exit event.
+            logger.warning("Could not inspect instance %s: %s", row["id"], exc)
+            continue
+        if state is not None and state.active:
+            continue
+        logs = docker.container_logs(row["container_id"])
+        failure = docker.failure_message(state, logs)
         with database.connect() as connection:
             connection.execute(
                 "UPDATE instances SET status = 'failed', stopped_at = ?, "
-                "error_message = COALESCE(error_message, 'Container exited unexpectedly') "
+                "error_message = COALESCE(error_message, ?) "
                 "WHERE id = ? AND status = 'running'",
-                (datetime.now(UTC).isoformat(), row["id"]),
+                (datetime.now(UTC).isoformat(), failure, row["id"]),
             )
 
 
@@ -296,6 +316,7 @@ async def get_instance(
     docker: DockerDep,
 ) -> InstancePublic:
     """Single instance status, used by the UI while a container is starting."""
+    _reflect_dead_containers(user, database, docker)
     _resync_ports(user, database, docker, settings)
     with database.connect() as connection:
         row = connection.execute(

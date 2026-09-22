@@ -238,7 +238,7 @@ def test_admin_builds_uploaded_archive_immediately(client, admin_headers):
     assert built.json()["internal_port"] == 9999
     detail = client.get(f"/api/v1/challenges/{challenge['id']}", headers=admin_headers).json()
     assert detail["build_status"] == "success"
-    assert detail["docker_image"].endswith(":alpha0.0.4")
+    assert detail["docker_image"].endswith(":alpha0.0.3-hotfix.2")
 
     unsafe = io.BytesIO()
     with ZipFile(unsafe, "w") as bundle:

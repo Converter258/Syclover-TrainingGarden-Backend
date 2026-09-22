@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import re
 import subprocess
 import time
@@ -22,6 +23,22 @@ class ContainerError(RuntimeError):
 class StartedContainer:
     container_id: str
     public_port: int
+
+
+@dataclass(frozen=True)
+class ContainerState:
+    status: str
+    running: bool
+    restarting: bool
+    exit_code: int | None
+    oom_killed: bool
+    error: str
+    restart_count: int = 0
+
+    @property
+    def active(self) -> bool:
+        """Whether Docker still considers the workload live or recoverable."""
+        return self.running or self.status in {"created", "paused"}
 
 
 def _validated_bind_address(value: str) -> str:
@@ -93,11 +110,19 @@ class DockerService:
         public_port = self._await_published_port(container_id, internal_port)
         if public_port is None:
             logs = self.container_logs(container_id)
+            state = self.container_state(container_id)
             self.stop(container_id)
-            detail = f" Last output: {logs}" if logs else ""
             raise ContainerError(
                 "The container did not stay up long enough to publish its port; check the "
-                f"challenge command and port.{detail}"
+                f"challenge command and port. {self.failure_message(state, logs)}"
+            )
+        state = self._await_stable_container(container_id)
+        if state is None or not state.running or state.restart_count > 0:
+            logs = self.container_logs(container_id)
+            self.stop(container_id)
+            raise ContainerError(
+                "The container exited during startup. "
+                f"{self.failure_message(state, logs)}"
             )
         if port_range is not None and public_port not in port_range:
             self.stop(container_id)
@@ -198,9 +223,14 @@ class DockerService:
             return
         try:
             self._run(["docker", "rm", "--force", "--volumes", container_id], timeout=30)
-        except ContainerError:
+        except ContainerError as remove_error:
             # Fall back to a plain stop so a removal race is not reported as a failure.
-            self._run(["docker", "stop", "--time", "5", container_id], timeout=15)
+            try:
+                self._run(["docker", "stop", "--time", "5", container_id], timeout=15)
+            except ContainerError as stop_error:
+                if "no such container" in str(stop_error).lower():
+                    return
+                raise remove_error from stop_error
 
     def list_managed_containers(self) -> list[dict[str, str]]:
         """Challenge containers carrying the platform label, as ``id``/``name`` pairs."""
@@ -258,6 +288,119 @@ class DockerService:
         except ContainerError:
             return ""
 
+    def container_state(self, container_id: str) -> ContainerState | None:
+        """Return Docker's runtime state, or ``None`` only when the container is absent.
+
+        A daemon timeout or permission failure is deliberately propagated. Treating every
+        inspect error as a missing container used to turn transient Docker failures into the
+        misleading ``Container exited unexpectedly`` instance state.
+        """
+        if not CONTAINER_PATTERN.fullmatch(container_id):
+            raise ContainerError("Unsafe container identifier")
+        if self.mode == "mock":
+            return ContainerState("running", True, False, 0, False, "")
+        try:
+            output = self._run(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{json .State}}\t{{.RestartCount}}",
+                    container_id,
+                ],
+                timeout=15,
+            )
+        except ContainerError as exc:
+            detail = str(exc).lower()
+            if "no such object" in detail or "no such container" in detail:
+                return None
+            raise
+        state_output, separator, restart_output = output.rpartition("\t")
+        if not separator:
+            state_output = output
+            restart_output = "0"
+        try:
+            raw = json.loads(state_output)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ContainerError(f"Docker returned an invalid container state: {output[:200]}") from exc
+        if not isinstance(raw, dict):
+            raise ContainerError(f"Docker returned an invalid container state: {output[:200]}")
+        exit_code = raw.get("ExitCode")
+        try:
+            restart_count = int(restart_output)
+        except ValueError:
+            restart_count = 0
+        return ContainerState(
+            status=str(raw.get("Status") or "unknown").lower(),
+            running=bool(raw.get("Running")),
+            restarting=bool(raw.get("Restarting")),
+            exit_code=exit_code if isinstance(exit_code, int) else None,
+            oom_killed=bool(raw.get("OOMKilled")),
+            error=str(raw.get("Error") or "").strip(),
+            restart_count=max(restart_count, 0),
+        )
+
+    def _await_stable_container(
+        self,
+        container_id: str,
+        attempts: int = 5,
+        delay: float = 0.6,
+        stability_window: float = 5.0,
+    ) -> ContainerState | None:
+        """Reject an image that exits or enters a restart loop just after ``docker run``.
+
+        Keeping the process alive across a short stability window also gives ordinary
+        services time to bind their socket before the instance is advertised as running.
+        """
+        last_state: ContainerState | None = None
+        for attempt in range(attempts):
+            last_state = self.container_state(container_id)
+            if last_state is None:
+                return None
+            if last_state.restart_count > 0:
+                return last_state
+            if last_state.running:
+                # A second observation prevents a process that exits immediately after its
+                # port mapping appears from being recorded as a healthy running instance.
+                if attempt + 1 < attempts:
+                    time.sleep(stability_window)
+                    confirmed = self.container_state(container_id)
+                    if (
+                        confirmed is not None
+                        and confirmed.running
+                        and confirmed.restart_count == last_state.restart_count
+                    ):
+                        return confirmed
+                    last_state = confirmed
+                else:
+                    return last_state
+            if last_state is not None and last_state.status in {"exited", "dead", "removing"}:
+                return last_state
+            if attempt + 1 < attempts:
+                time.sleep(delay)
+        return last_state
+
+    @staticmethod
+    def failure_message(state: ContainerState | None, logs: str = "") -> str:
+        """Build an actionable, bounded diagnostic for an unavailable container."""
+        if state is None:
+            message = "Container is missing; it may have been removed outside the platform."
+        else:
+            parts = [f"Docker status: {state.status}"]
+            if state.exit_code is not None:
+                parts.append(f"exit code: {state.exit_code}")
+            if state.oom_killed:
+                parts.append("killed by the memory limit (OOM)")
+            if state.restart_count:
+                parts.append(f"restart count: {state.restart_count}")
+            if state.error:
+                parts.append(f"runtime error: {state.error[:240]}")
+            message = "; ".join(parts) + "."
+        clean_logs = " ".join(logs.split())[:500]
+        if clean_logs:
+            message += f" Last output: {clean_logs}"
+        return message
+
     def container_port(self, container_id: str, internal_port: int) -> int | None:
         """Current host port published for a container, or ``None`` when it is gone.
 
@@ -314,17 +457,8 @@ class DockerService:
             raise ContainerError(str(exc)) from exc
 
     def container_exists(self, container_id: str) -> bool:
-        if not CONTAINER_PATTERN.fullmatch(container_id):
-            raise ContainerError("Unsafe container identifier")
-        if self.mode == "mock":
-            return True
-        try:
-            self._run(
-                ["docker", "inspect", "--format", "{{.State.Running}}", container_id], timeout=15
-            )
-        except ContainerError:
-            return False
-        return True
+        """Compatibility helper: whether the container object exists in Docker."""
+        return self.container_state(container_id) is not None
 
     def apply_asset(self, container_id: str, path: Path, kind: str) -> str:
         if not CONTAINER_PATTERN.fullmatch(container_id):
