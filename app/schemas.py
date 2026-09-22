@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from app.services.flags import PLACEHOLDER
+from app.services.flags import template_wants_random
 
 CTF_CATEGORIES = ("Web", "Pwn", "Reverse", "Misc", "Crypto")
 AWDP_CATEGORIES = ("Web", "Pwn")
@@ -60,6 +60,7 @@ class ChallengeCreate(BaseModel):
     docker_image: str | None = Field(default=None, max_length=255)
     internal_port: int | None = Field(default=None, ge=1, le=65535)
     flag: str = Field(min_length=3, max_length=512)
+    dynamic_flag: bool = False
     tags: list[str] = Field(default_factory=list, max_length=20)
     status: Literal["draft", "published", "archived"] = "draft"
 
@@ -85,6 +86,7 @@ class ChallengeUpdate(BaseModel):
     docker_image: str | None = Field(default=None, max_length=255)
     internal_port: int | None = Field(default=None, ge=1, le=65535)
     flag: str | None = Field(default=None, min_length=3, max_length=512)
+    dynamic_flag: bool | None = None
     tags: list[str] | None = Field(default=None, max_length=20)
     status: Literal["draft", "published", "archived"] | None = None
 
@@ -180,6 +182,7 @@ class ChallengePublic(BaseModel):
     detected_port: int | None = None
     status: Literal["draft", "published", "archived"]
     flag_template: str | None = None
+    dynamic_flag: bool = False
     tags: list[str] = Field(default_factory=list)
     solved: bool = False
     attachments: list[AssetPublic] = Field(default_factory=list)
@@ -225,9 +228,13 @@ class InstancePublic(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def hide_other_players_flag(cls, value: Any) -> Any:
-        """The owning solution may read its instance flag; nobody else may."""
-        if isinstance(value, dict) and not value.get("mine", True):
+    def hide_instance_flag_from_players(cls, value: Any) -> Any:
+        """The instance flag is an administrator-only answer key.
+
+        Players must recover it from the deployed service; leaking it in the API would
+        hand over the solution the moment an environment starts.
+        """
+        if isinstance(value, dict) and not value.get("is_admin", False):
             data = dict(value)
             data["instance_flag"] = None
             return data

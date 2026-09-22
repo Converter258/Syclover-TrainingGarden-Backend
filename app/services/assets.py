@@ -23,20 +23,36 @@ def store_bytes(storage_path: Path, challenge_id: str, filename: str, content: b
     return f"{challenge_id}/{stored_name}", target
 
 
+def script_interpreter(path: Path) -> list[str]:
+    """Pick a syntax checker from the shebang so Python checks validate like shell ones."""
+    try:
+        first_line = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    except (OSError, IndexError):
+        first_line = ""
+    if "python" in first_line:
+        return ["python3", "-m", "py_compile"]
+    return ["/bin/sh", "-n"]
+
+
 def validate_asset(path: Path, kind: str) -> tuple[bool, str]:
     if kind in {"check_script", "fix_script"}:
+        command = script_interpreter(path)
         try:
             result = subprocess.run(
-                ["/bin/sh", "-n", str(path)],
+                [*command, str(path)],
                 capture_output=True,
                 check=False,
                 text=True,
-                timeout=5,
+                timeout=10,
             )
         except subprocess.TimeoutExpired:
-            return False, "Shell syntax validation timed out."
+            return False, "Syntax validation timed out."
+        except FileNotFoundError:
+            return False, f"{command[0]} is not available to validate this script."
         output = (result.stdout + result.stderr).strip()
-        return result.returncode == 0, output or "Shell syntax is valid."
+        if result.returncode == 0:
+            return True, f"Syntax is valid ({command[0]})."
+        return False, output or "Script failed syntax validation."
     if kind == "patch":
         text = path.read_text(encoding="utf-8", errors="replace")
         valid = ("diff --git " in text) or ("--- " in text and "+++ " in text and "@@" in text)

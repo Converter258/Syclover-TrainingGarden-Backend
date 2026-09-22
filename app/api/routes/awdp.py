@@ -149,7 +149,12 @@ async def deploy_defense_asset(
 ) -> DeploymentEventPublic:
     with database.connect() as connection:
         instance = connection.execute(
-            "SELECT * FROM instances WHERE id = ?", (instance_id,)
+            """
+            SELECT i.*, c.internal_port AS challenge_internal_port
+            FROM instances i JOIN challenges c ON c.id = i.challenge_id
+            WHERE i.id = ?
+            """,
+            (instance_id,),
         ).fetchone()
         asset = connection.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
         check_script = connection.execute(
@@ -168,7 +173,13 @@ async def deploy_defense_asset(
     if asset["validation_status"] != "valid":
         raise HTTPException(status_code=422, detail="Asset did not pass validation")
     if asset["kind"] != "patch":
-        raise HTTPException(status_code=422, detail="Only patch files can be deployed by participants")
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Only patch files can be deployed to an instance; Check and Fix scripts are "
+                "administrator assets for verifying a challenge"
+            ),
+        )
     if not check_script:
         raise HTTPException(status_code=422, detail="This AWDP challenge has no valid Check script")
 
@@ -179,12 +190,33 @@ async def deploy_defense_asset(
             settings.storage_path / asset["stored_name"],
             asset["kind"],
         )
+        # A challenge entry point rebuilds from the patched source on start, so the
+        # container is restarted before the Check runs: the verdict then describes the
+        # service the participants actually deployed, not the pre-patch process.
+        restart_output = ""
+        if instance["challenge_internal_port"]:
+            docker.restart(instance["container_id"], instance["challenge_internal_port"])
+            port = docker.container_port(instance["container_id"], instance["challenge_internal_port"])
+            if port is not None and port != instance["public_port"]:
+                with database.connect() as connection:
+                    connection.execute(
+                        "UPDATE instances SET public_port = ? WHERE id = ?", (port, instance_id)
+                    )
+            restart_output = "Instance restarted so the patched source was rebuilt."
         check_output = docker.apply_asset(
             instance["container_id"],
             settings.storage_path / check_script["stored_name"],
             "check_script",
         )
-        output = f"Patch output:\n{patch_output or 'Applied successfully.'}\n\nCheck output:\n{check_output or 'Check passed.'}"
+        output = "\n\n".join(
+            part
+            for part in (
+                f"Patch output:\n{patch_output or 'Applied successfully.'}",
+                restart_output,
+                f"Check output:\n{check_output or 'Check passed.'}",
+            )
+            if part
+        )
     except ContainerError as exc:
         success = False
         output = str(exc)

@@ -39,7 +39,12 @@ from app.services.assets import (
 )
 from app.services.build_log import IDLE_LIMIT_SECONDS, POLL_SECONDS, registry
 from app.services.docker import ContainerError
-from app.services.flags import PLACEHOLDER, normalize_template
+from app.services.flags import (
+    default_dynamic_flag,
+    dynamic_flag_for_template,
+    normalize_template,
+    template_wants_random,
+)
 from app.services.tags import (
     STATE_TAGS,
     set_challenge_tags,
@@ -111,9 +116,10 @@ def _challenge(
         **(stats or {}),
     }
     template = data.get("flag_template")
-    if not reveal_template and isinstance(template, str) and PLACEHOLDER in template:
+    if not reveal_template and template_wants_random(template):
         # A per-instance template is no use to players and should not be advertised.
         data["flag_template"] = None
+    data["dynamic_flag"] = bool(data.get("dynamic_flag"))
     return ChallengePublic.model_validate(data)
 
 
@@ -331,7 +337,7 @@ async def build_challenge_image(
             (now, challenge_id),
         )
 
-    image = f"syclover/training-garden-{challenge['slug']}:alpha0.0.2"
+    image = f"syclover/training-garden-{challenge['slug']}:alpha0.0.3"
     registry.start(challenge_id)
     registry.append(
         challenge_id,
@@ -600,16 +606,19 @@ async def create_challenge(
         )
     challenge_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
-    data = payload.model_dump(exclude={"flag", "tags"})
+    data = payload.model_dump(exclude={"flag", "tags", "dynamic_flag"})
     requested_tags = list(payload.tags)
+    flag_template = normalize_template(payload.flag, settings.flag_prefix)
+    dynamic_flag = dynamic_flag_for_template(flag_template, payload.dynamic_flag)
     try:
         with database.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO challenges (
                     id, title, slug, description, category, mode, difficulty, points,
-                    docker_image, internal_port, flag_template, flag_digest, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    docker_image, internal_port, flag_template, dynamic_flag, flag_digest,
+                    status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     challenge_id,
@@ -622,7 +631,8 @@ async def create_challenge(
                     data["points"],
                     data["docker_image"],
                     data["internal_port"],
-                    normalize_template(payload.flag),
+                    flag_template,
+                    int(dynamic_flag),
                     digest_flag(payload.flag, settings.secret_key),
                     data["status"],
                     now,
@@ -659,9 +669,19 @@ async def update_challenge(
     fields = payload.model_dump(exclude_unset=True)
     flag = fields.pop("flag", None)
     new_tags = fields.pop("tags", None)
+    requested_dynamic = fields.pop("dynamic_flag", None)
     if flag:
+        template = normalize_template(flag, settings.flag_prefix)
         fields["flag_digest"] = digest_flag(flag, settings.secret_key)
-        fields["flag_template"] = normalize_template(flag)
+        fields["flag_template"] = template
+        fields["dynamic_flag"] = int(
+            default_dynamic_flag(flag)
+            if requested_dynamic is None
+            else dynamic_flag_for_template(template, requested_dynamic)
+        )
+    elif requested_dynamic is not None:
+        # Toggling the switch alone keeps the stored flag text as the template.
+        fields["dynamic_flag"] = int(requested_dynamic)
     try:
         with database.connect() as connection:
             existing = connection.execute(

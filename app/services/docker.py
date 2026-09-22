@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,7 +64,6 @@ class DockerService:
                 "docker",
                 "run",
                 "--detach",
-                "--rm",
                 "--name",
                 name,
                 "--label",
@@ -80,6 +80,8 @@ class DockerService:
                 "256",
                 "--security-opt",
                 "no-new-privileges",
+                "--restart",
+                "unless-stopped",
                 "--env",
                 f"FLAG={flag}" if flag else "FLAG=",
                 "-p",
@@ -126,7 +128,9 @@ class DockerService:
         if await self._supports_buildx():
             # BuildKit needs --progress plain to emit line-oriented, streamable logs.
             command += ["--progress", "plain"]
-        command += ["--pull", "--tag", image, str(context)]
+        # Base images already present locally are reused: forcing --pull turns a registry
+        # hiccup into a failed challenge build on an otherwise healthy host.
+        command += ["--tag", image, str(context)]
         return await self._run_streaming(command, timeout=600, on_output=on_output)
 
     async def _supports_buildx(self) -> bool:
@@ -182,11 +186,20 @@ class DockerService:
         return output
 
     def stop(self, container_id: str) -> None:
+        """Stop and remove one challenge container.
+
+        ``--restart unless-stopped`` keeps patched containers alive across daemon
+        restarts, so removing has to be explicit instead of relying on ``--rm``.
+        """
         if not CONTAINER_PATTERN.fullmatch(container_id):
             raise ContainerError("Unsafe container identifier")
         if self.mode == "mock":
             return
-        self._run(["docker", "stop", "--time", "5", container_id], timeout=15)
+        try:
+            self._run(["docker", "rm", "--force", "--volumes", container_id], timeout=30)
+        except ContainerError:
+            # Fall back to a plain stop so a removal race is not reported as a failure.
+            self._run(["docker", "stop", "--time", "5", container_id], timeout=15)
 
     def list_managed_containers(self) -> list[dict[str, str]]:
         """Challenge containers carrying the platform label, as ``id``/``name`` pairs."""
@@ -213,6 +226,49 @@ class DockerService:
             containers.append({"id": parts[0].strip(), "name": parts[1].strip()})
         return containers
 
+    def container_port(self, container_id: str, internal_port: int) -> int | None:
+        """Current host port published for a container, or ``None`` when it is gone.
+
+        Docker may hand out a different host port when a container is restarted outside
+        the platform, so the stored mapping is refreshed from the daemon.
+        """
+        if not CONTAINER_PATTERN.fullmatch(container_id):
+            raise ContainerError("Unsafe container identifier")
+        if self.mode == "mock":
+            return None
+        try:
+            output = self._run(
+                ["docker", "port", container_id, f"{internal_port}/tcp"], timeout=10
+            ).strip()
+        except ContainerError:
+            return None
+        for line in output.splitlines():
+            _, _, port = line.rpartition(":")
+            if port.isdigit():
+                return int(port)
+        return None
+
+    def restart(self, container_id: str, internal_port: int, timeout: int = 60) -> None:
+        """Restart a challenge container and wait until it serves connections again.
+
+        Patches change the challenge source, and challenge entry points rebuild from that
+        source on start, so a restart is what makes a defence actually take effect. Docker
+        may also publish a different host port after a restart, which the caller re-reads
+        through :meth:`container_port`.
+        """
+        if not CONTAINER_PATTERN.fullmatch(container_id):
+            raise ContainerError("Unsafe container identifier")
+        if self.mode == "mock":
+            return
+        self._run(["docker", "restart", container_id], timeout=timeout)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            port = self.container_port(container_id, internal_port)
+            if port is not None:
+                return
+            time.sleep(1)
+        raise ContainerError("The patched instance did not become reachable after a restart")
+
     def container_exists(self, container_id: str) -> bool:
         if not CONTAINER_PATTERN.fullmatch(container_id):
             raise ContainerError("Unsafe container identifier")
@@ -234,7 +290,9 @@ class DockerService:
         target = f"/tmp/syclover-{path.name}"
         self._run(["docker", "cp", str(path), f"{container_id}:{target}"], timeout=20)
         if kind in {"check_script", "fix_script"}:
-            command = ["docker", "exec", container_id, "/bin/sh", target]
+            # The interpreter is decided from the host-side file: the container path only
+            # exists inside the challenge container.
+            command = ["docker", "exec", container_id, *self._script_command(path, target)]
         elif kind == "patch":
             command = [
                 "docker",
@@ -247,6 +305,17 @@ class DockerService:
         else:
             raise ContainerError("Only patches and fix scripts can be applied")
         return self._run(command, timeout=30)
+
+    @staticmethod
+    def _script_command(host_path: Path, container_target: str) -> list[str]:
+        """Pick the interpreter from the shebang so Python checks work as well as shell ones."""
+        try:
+            first_line = host_path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        except (OSError, IndexError):
+            first_line = ""
+        if "python" in first_line:
+            return ["python3", container_target]
+        return ["/bin/sh", container_target]
 
     @staticmethod
     def _run(command: list[str], timeout: int) -> str:

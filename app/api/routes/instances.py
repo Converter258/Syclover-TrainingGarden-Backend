@@ -47,6 +47,7 @@ def _serialize(row, user: dict | None = None, public_host: str | None = None) ->
         data["public_host"] = public_host
     if user is not None:
         data["mine"] = data.get("user_id") == user["id"]
+        data["is_admin"] = user["role"] == "admin"
     return InstancePublic.model_validate(data)
 
 
@@ -74,6 +75,34 @@ def _launch_instance(instance_id: str, public_host: str, launch: dict, database,
 def _reclaim(database, docker) -> None:
     """Reclaim expired instances before answering a request, for all users."""
     expire_instances(database, docker)
+
+
+def _resync_ports(user: dict, database, docker, settings) -> None:
+    """Refresh published ports when a container was restarted outside the platform."""
+    with database.connect() as connection:
+        condition = "" if user["role"] == "admin" else "AND i.user_id = ?"
+        values = () if user["role"] == "admin" else (user["id"],)
+        rows = connection.execute(
+            f"""
+            SELECT i.id, i.container_id, i.public_port, c.internal_port
+            FROM instances i JOIN challenges c ON c.id = i.challenge_id
+            WHERE i.status = 'running' AND i.container_id IS NOT NULL
+              AND c.internal_port IS NOT NULL {condition}
+            """,
+            values,
+        ).fetchall()
+    for row in rows:
+        current = docker.container_port(row["container_id"], row["internal_port"])
+        if current is None or current == row["public_port"]:
+            continue
+        with database.connect() as connection:
+            connection.execute(
+                "UPDATE instances SET public_port = ? WHERE id = ? AND status = 'running'",
+                (current, row["id"]),
+            )
+        logger.info(
+            "Instance %s port refreshed: %s -> %s", row["id"], row["public_port"], current
+        )
 
 
 def _reflect_dead_containers(user: dict, database, docker) -> None:
@@ -110,6 +139,7 @@ async def list_instances(
 ) -> list[InstancePublic]:
     _reclaim(database, docker)
     _reflect_dead_containers(user, database, docker)
+    _resync_ports(user, database, docker, settings)
     public_host = _effective_public_host(request, settings)
     with database.connect() as connection:
         if user["role"] == "admin":
@@ -157,7 +187,11 @@ async def start_instance(
 
     instance_id = str(uuid.uuid4())
     container_name = f"sycl-{instance_id.replace('-', '')[:20]}"
-    instance_flag = render_instance_flag(challenge["flag_template"], settings.flag_prefix)
+    instance_flag = render_instance_flag(
+        challenge["flag_template"],
+        dynamic=bool(challenge["dynamic_flag"]),
+        default_prefix=settings.flag_prefix,
+    )
     now = datetime.now(UTC)
     expires_at = now + timedelta(minutes=settings.instance_ttl_minutes)
     with database.connect() as connection:
@@ -233,8 +267,10 @@ async def get_instance(
     user: CurrentUser,
     database: DatabaseDep,
     settings: SettingsDep,
+    docker: DockerDep,
 ) -> InstancePublic:
     """Single instance status, used by the UI while a container is starting."""
+    _resync_ports(user, database, docker, settings)
     with database.connect() as connection:
         row = connection.execute(
             "SELECT i.*, c.title AS challenge_title FROM instances i JOIN challenges c ON c.id = i.challenge_id "

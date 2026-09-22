@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS challenges (
     build_output TEXT,
     detected_port INTEGER,
     flag_template TEXT,
+    dynamic_flag INTEGER NOT NULL DEFAULT 0,
     flag_digest TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'archived')),
     created_at TEXT NOT NULL,
@@ -188,7 +189,8 @@ class Database:
                         build_status TEXT NOT NULL DEFAULT 'none'
                             CHECK (build_status IN ('none', 'building', 'success', 'failed')),
                         build_output TEXT, detected_port INTEGER,
-                        flag_template TEXT, flag_digest TEXT NOT NULL,
+                        flag_template TEXT, dynamic_flag INTEGER NOT NULL DEFAULT 0,
+                        flag_digest TEXT NOT NULL,
                         status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'archived')),
                         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
                     );
@@ -240,6 +242,15 @@ class Database:
                 connection.execute("ALTER TABLE challenges ADD COLUMN flag_template TEXT")
             if challenge_columns and "detected_port" not in challenge_columns:
                 connection.execute("ALTER TABLE challenges ADD COLUMN detected_port INTEGER")
+            if challenge_columns and "dynamic_flag" not in challenge_columns:
+                connection.execute(
+                    "ALTER TABLE challenges ADD COLUMN dynamic_flag INTEGER NOT NULL DEFAULT 0"
+                )
+                # Challenges created before the switch existed expressed randomness via a token.
+                connection.execute(
+                    "UPDATE challenges SET dynamic_flag = 1 "
+                    "WHERE flag_template LIKE '%<RANDOM>%'"
+                )
             instance_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(instances)").fetchall()
             }

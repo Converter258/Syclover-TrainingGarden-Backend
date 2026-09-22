@@ -279,6 +279,23 @@ def test_docker_build_adapts_to_the_available_builder(monkeypatch, tmp_path):
     without_buildx = asyncio.run(scenario(False))
     assert "--progress" not in without_buildx
     assert without_buildx[:2] == ["docker", "build"]
+    # cached base images must be reusable when the registry is unreachable
+    assert "--pull" not in with_buildx and "--pull" not in without_buildx
+
+
+def test_script_interpreter_follows_the_shebang(tmp_path):
+    from app.services.assets import script_interpreter
+    from app.services.docker import DockerService
+
+    shell = tmp_path / "check.sh"
+    shell.write_text("#!/bin/sh\necho ok\n")
+    python = tmp_path / "check.py"
+    python.write_text("#!/usr/bin/env python3\nprint('ok')\n")
+
+    assert DockerService._script_command(shell, "/tmp/x") == ["/bin/sh", "/tmp/x"]
+    assert DockerService._script_command(python, "/tmp/y") == ["python3", "/tmp/y"]
+    assert script_interpreter(shell) == ["/bin/sh", "-n"]
+    assert script_interpreter(python) == ["python3", "-m", "py_compile"]
 
 
 def test_build_registry_keeps_progress_and_final_output():

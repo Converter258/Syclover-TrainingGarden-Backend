@@ -1,35 +1,80 @@
 from __future__ import annotations
 
 from app.services.flags import (
-    PLACEHOLDER,
+    RAND_TOKEN,
+    default_dynamic_flag,
+    dynamic_flag_for_template,
     looks_like_flag,
     normalize_template,
     render_instance_flag,
+    template_wants_random,
 )
 from tests.conftest import auth_header
 
 
-def test_normalize_template_keeps_fixed_and_marks_random_flags():
+def test_normalize_template_keeps_the_administrator_text():
     assert normalize_template("SYC{fixed_value}") == "SYC{fixed_value}"
+    assert normalize_template("SYC{RAND}") == "SYC{RAND}"
     assert normalize_template("SYC{<RANDOM>}") == "SYC{<RANDOM>}"
-    assert normalize_template("SYCLOVER{<RANDOM>}") == "SYCLOVER{<RANDOM>}"
-    assert normalize_template("plain-text-flag") == "SYC{<RANDOM>}"
-    assert normalize_template("plain-text-flag", default_prefix="FLG") == "FLG{<RANDOM>}"
+    # malformed flags are rebuilt so a shared literal is never handed to every instance
+    assert normalize_template("plain-text-flag") == "SYC{RAND}"
+    assert normalize_template("plain-text-flag", default_prefix="FLG") == "FLG{RAND}"
 
 
-def test_render_instance_flag_is_unique_per_instance():
-    first = render_instance_flag("SYCLOVER{<RANDOM>}")
-    second = render_instance_flag("SYCLOVER{<RANDOM>}")
+def test_dynamic_switch_comes_from_the_token_or_the_admin():
+    assert default_dynamic_flag("SYC{RAND}") is True
+    assert default_dynamic_flag("SYC{fixed}") is False
+    assert dynamic_flag_for_template("SYC{fixed}", True) is True
+    assert dynamic_flag_for_template("SYC{RAND}", False) is True
+    assert template_wants_random("SYC{RAND}") is True
+    assert template_wants_random("SYC{fixed}") is False
 
-    assert first.startswith("SYCLOVER{") and first.endswith("}")
+
+def test_render_instance_flag_randomises_only_when_enabled():
+    first = render_instance_flag("SYC{RAND}", dynamic=True)
+    second = render_instance_flag("SYC{RAND}", dynamic=True)
+    assert first.startswith("SYC{") and first.endswith("}")
+    assert RAND_TOKEN not in first
     assert first != second
     assert looks_like_flag(first) and looks_like_flag(second)
-    assert render_instance_flag("SYC{fixed_value}") == "SYC{fixed_value}"
-    assert looks_like_flag(render_instance_flag(None))
-    assert looks_like_flag(render_instance_flag(normalize_template("plain-text-flag")))
+
+    # a static flag stays literally the same for every instance
+    assert render_instance_flag("SYC{fixed_value}", dynamic=False) == "SYC{fixed_value}"
+    # the switch alone is enough, even without an explicit token
+    appended = render_instance_flag("SYC{base}", dynamic=True)
+    assert appended.startswith("SYC{base") and appended.endswith("}")
+    assert render_instance_flag(None, dynamic=True) != render_instance_flag(None, dynamic=True)
+    assert looks_like_flag(render_instance_flag(normalize_template("plain-text-flag"), dynamic=True))
 
 
-def test_instance_receives_its_own_flag_and_submits_it(client, admin_headers, player_headers):
+def test_players_never_see_the_instance_flag_only_admins_do(client, admin_headers, player_headers):
+    challenge = next(
+        item
+        for item in client.get("/api/v1/challenges?mode=ctf", headers=player_headers).json()
+        if item["slug"] == "welcome-header"
+    )
+    started = client.post(f"/api/v1/instances/{challenge['id']}", headers=player_headers)
+    assert started.status_code == 201
+    instance_id = started.json()["id"]
+    assert started.json()["instance_flag"] is None
+
+    player_view = client.get(f"/api/v1/instances/{instance_id}", headers=player_headers).json()
+    assert player_view["instance_flag"] is None
+    assert player_view["connect_command"]
+
+    admin_view = client.get(f"/api/v1/instances/{instance_id}", headers=admin_headers).json()
+    admin_flag = admin_view["instance_flag"]
+    assert admin_flag
+
+    submitted = client.post(
+        f"/api/v1/challenges/{challenge['id']}/submit",
+        headers=player_headers,
+        json={"flag": admin_flag},
+    )
+    assert submitted.json()["correct"] is True
+
+
+def test_instance_flag_follows_its_own_instance(client, admin_headers, player_headers):
     payload = {
         "title": "Randomised Box",
         "slug": "randomised-box",
@@ -40,30 +85,28 @@ def test_instance_receives_its_own_flag_and_submits_it(client, admin_headers, pl
         "points": 120,
         "docker_image": "alpine:3.20",
         "internal_port": 9999,
-        "flag": "SYCLOVER{<RANDOM>}",
+        "flag": "SYCLOVER{RAND}",
         "status": "draft",
     }
     created = client.post("/api/v1/challenges", headers=admin_headers, json=payload)
     assert created.status_code == 201
-    challenge_id = created.json()["id"]
-    assert created.json()["flag_template"] == "SYCLOVER{<RANDOM>}"
+    body = created.json()
+    challenge_id = body["id"]
+    assert body["flag_template"] == "SYCLOVER{RAND}"
+    assert body["dynamic_flag"] is True
 
     published = client.patch(
         f"/api/v1/challenges/{challenge_id}", headers=admin_headers, json={"status": "published"}
     )
     assert published.status_code == 200
-    anonymous = auth_header(client, "template_viewer", "TemplatePass123!")
-    visible = client.get(f"/api/v1/challenges/{challenge_id}", headers=anonymous).json()
-    assert visible["flag_template"] is None
+    viewer = auth_header(client, "template_viewer", "TemplatePass123!")
+    assert client.get(f"/api/v1/challenges/{challenge_id}", headers=viewer).json()["flag_template"] is None
 
     instance = client.post(f"/api/v1/instances/{challenge_id}", headers=player_headers)
     assert instance.status_code == 201
-    instance_flag = instance.json()["instance_flag"]
-    assert instance_flag and instance_flag.startswith("SYCLOVER{") and instance_flag != "SYCLOVER{<RANDOM>}"
-    listed = client.get("/api/v1/instances", headers=player_headers).json()
-    assert listed[0]["instance_flag"] == instance_flag
-    admin_view = client.get("/api/v1/instances", headers=admin_headers).json()
-    assert admin_view[0]["instance_flag"] is None
+    instance_id = instance.json()["id"]
+    instance_flag = client.get(f"/api/v1/instances/{instance_id}", headers=admin_headers).json()["instance_flag"]
+    assert instance_flag.startswith("SYCLOVER{") and RAND_TOKEN not in instance_flag
 
     wrong = client.post(
         f"/api/v1/challenges/{challenge_id}/submit",
@@ -76,46 +119,93 @@ def test_instance_receives_its_own_flag_and_submits_it(client, admin_headers, pl
         headers=player_headers,
         json={"flag": instance_flag},
     )
-    assert correct.json() == {
-        "correct": True,
-        "awarded_points": 120,
-        "message": "Correct flag",
-    }
+    assert correct.json() == {"correct": True, "awarded_points": 120, "message": "Correct flag"}
 
     other = auth_header(client, "flag_borrower", "FlagBorrow123!")
-    borrowed = client.post(
+    assert client.post(
         f"/api/v1/challenges/{challenge_id}/submit",
         headers=other,
         json={"flag": instance_flag},
-    )
-    assert borrowed.json()["correct"] is False
+    ).json()["correct"] is False
 
 
-def test_placeholder_only_template_is_hidden_and_still_scored(client, admin_headers, player_headers):
+def test_static_flag_challenge_keeps_one_shared_answer(client, admin_headers, player_headers):
     payload = {
-        "title": "Opaque Template",
-        "slug": "opaque-template",
-        "description": "A flag without the PREFIX{...} convention still gets random values.",
+        "title": "Static Answer",
+        "slug": "static-answer",
+        "description": "A challenge that deliberately shares one literal flag.",
         "category": "Misc",
         "mode": "ctf",
         "difficulty": "noob",
         "points": 60,
         "docker_image": "alpine:3.20",
         "internal_port": 9999,
-        "flag": "plain-text-flag",
+        "flag": "SYC{shared_secret}",
+        "dynamic_flag": False,
         "status": "published",
     }
-    challenge_id = client.post("/api/v1/challenges", headers=admin_headers, json=payload).json()["id"]
-    instance = client.post(f"/api/v1/instances/{challenge_id}", headers=player_headers).json()
-    assert instance["instance_flag"].startswith("SYC{")
+    created = client.post("/api/v1/challenges", headers=admin_headers, json=payload).json()
+    assert created["dynamic_flag"] is False
+    assert created["flag_template"] == "SYC{shared_secret}"
 
-    visible = client.get(f"/api/v1/challenges/{challenge_id}", headers=player_headers).json()
-    assert visible["flag_template"] is None
+    instance = client.post(f"/api/v1/instances/{created['id']}", headers=player_headers).json()
+    admin_flag = client.get(f"/api/v1/instances/{instance['id']}", headers=admin_headers).json()["instance_flag"]
+    assert admin_flag == "SYC{shared_secret}"
 
-    correct = client.post(
-        f"/api/v1/challenges/{challenge_id}/submit",
+    accepted = client.post(
+        f"/api/v1/challenges/{created['id']}/submit",
         headers=player_headers,
-        json={"flag": instance["instance_flag"]},
+        json={"flag": "SYC{shared_secret}"},
     )
-    assert correct.json()["correct"] is True
-    assert PLACEHOLDER not in (visible["flag_template"] or "")
+    assert accepted.json()["correct"] is True
+
+
+def test_dynamic_switch_can_be_toggled_after_creation(client, admin_headers):
+    payload = {
+        "title": "Toggle Me",
+        "slug": "toggle-me",
+        "description": "The dynamic switch can be flipped without changing the flag.",
+        "category": "Misc",
+        "mode": "ctf",
+        "difficulty": "noob",
+        "points": 60,
+        "docker_image": "alpine:3.20",
+        "internal_port": 9999,
+        "flag": "SYC{toggled}",
+        "status": "published",
+    }
+    created = client.post("/api/v1/challenges", headers=admin_headers, json=payload).json()
+    assert created["dynamic_flag"] is False
+
+    enabled = client.patch(
+        f"/api/v1/challenges/{created['id']}", headers=admin_headers, json={"dynamic_flag": True}
+    )
+    assert enabled.status_code == 200
+    assert enabled.json()["dynamic_flag"] is True
+
+    disabled = client.patch(
+        f"/api/v1/challenges/{created['id']}", headers=admin_headers, json={"dynamic_flag": False}
+    )
+    assert disabled.json()["dynamic_flag"] is False
+
+
+def test_legacy_placeholder_flag_is_migrated_to_the_dynamic_switch(client, admin_headers):
+    created = client.post(
+        "/api/v1/challenges",
+        headers=admin_headers,
+        json={
+            "title": "Legacy Token",
+            "slug": "legacy-token",
+            "description": "Created with the previous placeholder syntax.",
+            "category": "Misc",
+            "mode": "ctf",
+            "difficulty": "noob",
+            "points": 60,
+            "docker_image": "alpine:3.20",
+            "internal_port": 9999,
+            "flag": "SYC{<RANDOM>}",
+            "status": "published",
+        },
+    ).json()
+    assert created["dynamic_flag"] is True
+    assert created["flag_template"] == "SYC{<RANDOM>}"
