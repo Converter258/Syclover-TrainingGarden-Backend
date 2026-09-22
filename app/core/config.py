@@ -93,7 +93,7 @@ def get_settings() -> Settings:
         flag_prefix=os.getenv("SYCL_FLAG_PREFIX", "SYC").strip() or "SYC",
         public_base_url=os.getenv("SYCL_PUBLIC_BASE_URL", "").strip().rstrip("/"),
         docker_mode=os.getenv("SYCL_DOCKER_MODE", "cli"),
-        seed_demo=_as_bool(os.getenv("SYCL_SEED_DEMO"), True),
+        seed_demo=_as_bool(os.getenv("SYCL_SEED_DEMO"), False),
         admin_username=os.getenv("SYCL_ADMIN_USERNAME", "admin"),
         admin_password=os.getenv("SYCL_ADMIN_PASSWORD", "Syclover@2026") or None,
         max_upload_bytes=int(os.getenv("SYCL_MAX_UPLOAD_BYTES", str(10 * 1024 * 1024))),
