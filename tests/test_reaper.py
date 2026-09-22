@@ -129,12 +129,15 @@ def test_sweep_reports_both_reclamations(tmp_path):
 
 
 def test_docker_port_spec_honours_bind_address_and_range():
-    # the caller passes the address resolved by _publish_bind
-    assert DockerService._port_spec("0.0.0.0", 9999, None) == "0.0.0.0::9999"
-    assert DockerService._port_spec("127.0.0.1", 9999, None) == "127.0.0.1::9999"
-    assert DockerService._port_spec("::", 9999, None) == "[::]::9999"
-    assert DockerService._port_spec("127.0.0.1", 9999, range(30000, 30001)) == "127.0.0.1:30000:9999"
-    assert DockerService._port_spec("0.0.0.0", 9999, range(30000, 30100)) == "0.0.0.0::9999"
+    from app.services.docker import _port_spec
+
+    # without a configured range Docker picks the port, so no host port is given
+    assert _port_spec("0.0.0.0", 9999, None) == "0.0.0.0::9999"
+    assert _port_spec("127.0.0.1", 9999, None) == "127.0.0.1::9999"
+    assert _port_spec("::", 9999, None) == "[::]::9999"
+    # with a range the platform allocates the host port explicitly
+    assert _port_spec("127.0.0.1", 9999, 30000) == "127.0.0.1:30000:9999"
+    assert _port_spec("0.0.0.0", 9999, 30042) == "0.0.0.0:30042:9999"
 
 
 def test_docker_start_rejects_non_ip_bind_address(monkeypatch):
@@ -151,18 +154,21 @@ def test_docker_start_rejects_non_ip_bind_address(monkeypatch):
         )
 
 
-def test_docker_start_uses_configured_bind_address_and_range(monkeypatch, tmp_path):
+def test_docker_start_allocates_a_port_from_the_configured_range(monkeypatch, tmp_path):
     docker = DockerService(mode="cli")
     commands: list[list[str]] = []
+    publishing: dict[str, str] = {}
     monkeypatch.setattr("app.services.docker.time.sleep", lambda _: None)
 
     def fake_run(command, timeout):
         commands.append(command)
         if command[1] == "run":
+            publishing["host_port"] = command[command.index("-p") + 1].rsplit(":", 2)[1]
             return "cid123"
         if command[1] == "inspect":
             return '{"Status":"running","Running":true,"Restarting":false,"ExitCode":0}'
-        return "0.0.0.0:32000\n"
+        # Docker reports back the host port the platform asked for.
+        return f"0.0.0.0:{publishing['host_port']}\n"
 
     monkeypatch.setattr(docker, "_run", fake_run)
     started = docker.start(
@@ -175,9 +181,10 @@ def test_docker_start_uses_configured_bind_address_and_range(monkeypatch, tmp_pa
         port_range=range(32000, 32100),
     )
 
-    assert started.public_port == 32000
-    # an explicit range is what allows the container to be registered on 0.0.0.0
-    assert "0.0.0.0::9999" in commands[0]
+    # The platform must pin the host port itself; letting Docker choose would land
+    # outside the small window operators open at the cloud provider.
+    assert 32000 <= started.public_port < 32100
+    assert f"0.0.0.0:{started.public_port}:9999" in commands[0]
 
 
 def test_docker_start_rejects_port_outside_configured_range(monkeypatch):

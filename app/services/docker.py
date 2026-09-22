@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import random
 import re
 import subprocess
 import tempfile
@@ -54,6 +55,34 @@ def _validated_bind_address(value: str) -> str:
         raise ContainerError(f"Invalid instance bind address: {value}") from exc
 
 
+def _port_spec(bind: str, internal_port: int, host_port: int | None = None) -> str:
+    """Publish ``internal_port`` on an explicit host port, or let Docker choose one.
+
+    Docker picks from the host's ephemeral range (``net.ipv4.ip_local_port_range``)
+    when no host port is given, which is why a configured range has to be applied
+    here rather than validated after the fact.
+    """
+    host_bind = f"[{bind}]" if ":" in bind else bind
+    if host_port is None:
+        return f"{host_bind}::{internal_port}"
+    return f"{host_bind}:{host_port}:{internal_port}"
+
+
+def _candidate_ports(port_range: range) -> list[int]:
+    """Ports to try, rotated so concurrent starts do not all fight over one port."""
+    ports = list(port_range)
+    if len(ports) > 1:
+        offset = random.randrange(len(ports))
+        ports = ports[offset:] + ports[:offset]
+    return ports
+
+
+def _is_port_conflict(error: Exception) -> bool:
+    """Whether a failed start only lost a race for the host port."""
+    message = str(error).lower()
+    return "port is already allocated" in message or "address already in use" in message
+
+
 class DockerService:
     def __init__(self, mode: str = "cli"):
         self.mode = mode
@@ -78,8 +107,63 @@ class DockerService:
         if self.mode == "mock":
             return StartedContainer(container_id=f"mock-{name}", public_port=10000 + internal_port % 50000)
         bind = _validated_bind_address(bind_address)
-        if port_range is not None and len(port_range) == 0:
+        if port_range is None:
+            # No configured window: let Docker pick, as it always has.
+            return self._start_container(
+                image=image,
+                internal_port=internal_port,
+                name=name,
+                user_id=user_id,
+                challenge_id=challenge_id,
+                bind=bind,
+                flag=flag,
+                port_spec=_port_spec(bind, internal_port),
+                port_range=None,
+            )
+        if len(port_range) == 0:
             raise ContainerError("The configured instance port range is empty")
+        candidates = _candidate_ports(port_range)
+        for index, host_port in enumerate(candidates):
+            try:
+                return self._start_container(
+                    image=image,
+                    internal_port=internal_port,
+                    name=name,
+                    user_id=user_id,
+                    challenge_id=challenge_id,
+                    bind=bind,
+                    flag=flag,
+                    port_spec=_port_spec(bind, internal_port, host_port),
+                    port_range=port_range,
+                )
+            except ContainerError as exc:
+                if not _is_port_conflict(exc):
+                    raise
+                # Someone took this port between picking it and binding it. Clean the
+                # half-created container up so the retry can reuse the same name.
+                self._discard_container(name)
+                if index + 1 == len(candidates):
+                    raise ContainerError(
+                        "No free host port in the configured range "
+                        f"{port_range.start}-{port_range.stop - 1}: all {len(candidates)} port(s) "
+                        "are in use. Widen SYCL_INSTANCE_PORT_RANGE_START/END or wait for "
+                        "instances to expire."
+                    ) from exc
+        raise ContainerError("No usable host port in the configured instance port range")
+
+    def _start_container(
+        self,
+        *,
+        image: str,
+        internal_port: int,
+        name: str,
+        user_id: str,
+        challenge_id: str,
+        bind: str,
+        flag: str | None,
+        port_spec: str,
+        port_range: range | None,
+    ) -> StartedContainer:
         container_id = self._run(
             [
                 "docker",
@@ -106,7 +190,7 @@ class DockerService:
                 "--env",
                 f"FLAG={flag}" if flag else "FLAG=",
                 "-p",
-                self._port_spec(bind, internal_port, port_range),
+                port_spec,
                 image,
             ],
             timeout=90,
@@ -136,12 +220,14 @@ class DockerService:
             )
         return StartedContainer(container_id=container_id, public_port=public_port)
 
-    @staticmethod
-    def _port_spec(bind: str, internal_port: int, port_range: range | None) -> str:
-        host_bind = f"[{bind}]" if ":" in bind else bind
-        if port_range is not None and len(port_range) == 1:
-            return f"{host_bind}:{port_range.start}:{internal_port}"
-        return f"{host_bind}::{internal_port}"
+    def _discard_container(self, name: str) -> None:
+        """Best-effort removal of a container left behind by a failed start attempt."""
+        if self.mode == "mock" or not CONTAINER_PATTERN.fullmatch(name):
+            return
+        try:
+            self._run(["docker", "rm", "--force", "--volumes", name], timeout=20)
+        except ContainerError:
+            pass
 
     async def build(self, *, context: Path, image: str, on_output=None) -> str:
         """Build an image, forwarding each output chunk to ``on_output`` when given."""
