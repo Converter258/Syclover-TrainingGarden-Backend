@@ -188,6 +188,9 @@ ACHIEVEMENT_DEFINITIONS = (
     ("five_solves", "渐入佳境", "累计解开 5 道不同题目", "累计解开 5 道题", "five-solves"),
     ("ten_solves", "稳步生长", "累计解开 10 道不同题目", "累计解开 10 道题", "ten-solves"),
     ("first_defense", "守护新芽", "首次成功部署修复并通过防御检查", "首次完成 AWDP 防御", "first-defense"),
+    ("first_try", "一发入魂", "没有试错，首次提交就解开一道题", "任意题目首次提交即正确", "first-try"),
+    ("comeback", "越挫越勇", "一次次尝试后终于找到正确答案", "同一道题答错至少 3 次后解出", "comeback"),
+    ("versatile", "跨界玩家", "在三个不同方向留下解题记录", "解开 3 个不同分类的题目", "versatile"),
 )
 
 

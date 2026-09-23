@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import posixpath
 import random
 import re
 import subprocess
@@ -87,6 +88,7 @@ class DockerService:
     def __init__(self, mode: str = "cli"):
         self.mode = mode
         self._buildx: bool | None = None
+        self._mock_next_port = 30000
 
     def start(
         self,
@@ -105,7 +107,9 @@ class DockerService:
         if flag is not None and not FLAG_PATTERN.fullmatch(flag):
             raise ContainerError("Unsafe instance flag value")
         if self.mode == "mock":
-            return StartedContainer(container_id=f"mock-{name}", public_port=10000 + internal_port % 50000)
+            public_port = self._mock_next_port
+            self._mock_next_port += 1
+            return StartedContainer(container_id=f"mock-{name}", public_port=public_port)
         bind = _validated_bind_address(bind_address)
         if port_range is None:
             # No configured window: let Docker pick, as it always has.
@@ -164,37 +168,44 @@ class DockerService:
         port_spec: str,
         port_range: range | None,
     ) -> StartedContainer:
-        container_id = self._run(
-            [
-                "docker",
-                "run",
-                "--detach",
-                "--name",
-                name,
-                "--label",
-                CONTAINER_LABEL,
-                "--label",
-                f"syclover.user={user_id}",
-                "--label",
-                f"syclover.challenge={challenge_id}",
-                "--memory",
-                "512m",
-                "--cpus",
-                "1.0",
-                "--pids-limit",
-                "256",
-                "--security-opt",
-                "no-new-privileges",
-                "--restart",
-                "unless-stopped",
-                "--env",
-                f"FLAG={flag}" if flag else "FLAG=",
-                "-p",
-                port_spec,
-                image,
-            ],
-            timeout=90,
-        ).strip()
+        command = [
+            "docker",
+            "create" if flag else "run",
+            *([] if flag else ["--detach"]),
+            "--name",
+            name,
+            "--label",
+            CONTAINER_LABEL,
+            "--label",
+            f"syclover.user={user_id}",
+            "--label",
+            f"syclover.challenge={challenge_id}",
+            "--memory",
+            "512m",
+            "--cpus",
+            "1.0",
+            "--pids-limit",
+            "256",
+            "--security-opt",
+            "no-new-privileges",
+            "--restart",
+            "unless-stopped",
+            "--env",
+            f"FLAG={flag}" if flag else "FLAG=",
+            "-p",
+            port_spec,
+            image,
+        ]
+        container_id = self._run(command, timeout=90).strip()
+        if flag:
+            # A created container has its image filesystem but its service has not
+            # started yet. Populate missing flag files before the program can read them.
+            try:
+                self._ensure_flag_files(container_id, flag)
+                self._run(["docker", "start", container_id], timeout=45)
+            except ContainerError:
+                self._discard_container(container_id)
+                raise
         public_port = self._await_published_port(container_id, internal_port)
         if public_port is None:
             logs = self.container_logs(container_id)
@@ -219,6 +230,31 @@ class DockerService:
                 f"{port_range.start}-{port_range.stop - 1}"
             )
         return StartedContainer(container_id=container_id, public_port=public_port)
+
+    def _ensure_flag_files(self, container_id: str, flag: str) -> None:
+        """Create conventional flag paths only when the image does not provide them."""
+        workdir = self._run(
+            ["docker", "inspect", "--format", "{{.Config.WorkingDir}}", container_id],
+            timeout=15,
+        ).strip()
+        paths = {"/flag", "/flag.txt"}
+        if workdir.startswith("/") and ":" not in workdir and "\n" not in workdir:
+            paths.add(posixpath.join(posixpath.normpath(workdir), "flag"))
+        with tempfile.TemporaryDirectory(prefix="syclover-flag-") as temporary:
+            source = Path(temporary) / "flag"
+            source.write_text(f"{flag}\n", encoding="utf-8")
+            source.chmod(0o644)
+            for index, path in enumerate(sorted(paths)):
+                try:
+                    self._run(
+                        ["docker", "cp", f"{container_id}:{path}", str(Path(temporary) / f"probe-{index}")],
+                        timeout=15,
+                    )
+                except ContainerError as exc:
+                    message = str(exc).lower()
+                    if "could not find the file" not in message and "no such file" not in message:
+                        raise
+                    self._run(["docker", "cp", str(source), f"{container_id}:{path}"], timeout=15)
 
     def _discard_container(self, name: str) -> None:
         """Best-effort removal of a container left behind by a failed start attempt."""
@@ -331,6 +367,7 @@ class DockerService:
             [
                 "docker",
                 "ps",
+                "--all",
                 "--no-trunc",
                 "--filter",
                 f"label={CONTAINER_LABEL}",
@@ -437,7 +474,7 @@ class DockerService:
         delay: float = 0.6,
         stability_window: float = 5.0,
     ) -> ContainerState | None:
-        """Reject an image that exits or enters a restart loop just after ``docker run``.
+        """Reject an image that exits or enters a restart loop just after startup.
 
         Keeping the process alive across a short stability window also gives ordinary
         services time to bind their socket before the instance is advertised as running.

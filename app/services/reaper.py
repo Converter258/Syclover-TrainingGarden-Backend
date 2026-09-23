@@ -31,20 +31,25 @@ def expire_instances(
             expires_at = expires_at.replace(tzinfo=UTC)
         if expires_at > moment:
             continue
-        error: str | None = None
+        with database.connect() as connection:
+            claimed = connection.execute(
+                "UPDATE instances SET status = 'stopped', stopped_at = ? "
+                "WHERE id = ? AND status IN ('starting', 'running') AND expires_at = ?",
+                (moment.isoformat(), row["id"], row["expires_at"]),
+            )
+        if claimed.rowcount != 1:
+            # A concurrent extension or manual stop won the race.
+            continue
         if row["container_id"]:
             try:
                 docker.stop(row["container_id"])
             except ContainerError as exc:
-                error = str(exc)
                 logger.warning("Instance %s could not be stopped: %s", row["id"], exc)
-        with database.connect() as connection:
-            connection.execute(
-                "UPDATE instances SET status = 'stopped', stopped_at = ?, "
-                "error_message = COALESCE(?, error_message) WHERE id = ? "
-                "AND status IN ('starting', 'running')",
-                (moment.isoformat(), error, row["id"]),
-            )
+                with database.connect() as connection:
+                    connection.execute(
+                        "UPDATE instances SET error_message = ? WHERE id = ?",
+                        (str(exc), row["id"]),
+                    )
         expired.append(row["id"])
     return expired
 
