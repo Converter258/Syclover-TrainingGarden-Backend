@@ -22,6 +22,9 @@ def test_flag_submission_awards_only_once_and_updates_scoreboard(client, player_
         json={"flag": "SYC{wrong}"},
     )
     assert wrong.json()["correct"] is False
+    assert "first_solve" not in client.get(
+        "/api/v1/users/me/profile", headers=player_headers
+    ).json()["achievement_slugs"]
     correct = client.post(
         f"/api/v1/challenges/{challenge['id']}/submit",
         headers=player_headers,
@@ -34,6 +37,9 @@ def test_flag_submission_awards_only_once_and_updates_scoreboard(client, player_
         json={"flag": "SYC{welcome_to_training_garden}"},
     )
     assert repeat.json()["awarded_points"] == 0
+    profile = client.get("/api/v1/users/me/profile", headers=player_headers).json()
+    assert profile["achievement_slugs"].count("first_solve") == 1
+    assert "five_solves" not in profile["achievement_slugs"]
     ranking = client.get("/api/v1/scoreboard", headers=player_headers).json()["rankings"][0]
     assert ranking["username"] == "player"
     assert ranking["score"] == 100
@@ -164,6 +170,9 @@ def test_awdp_asset_validation_deploy_and_ownership(client, player_headers, admi
     ).json()
     assert defense_detail["defense_solves"] == 1
     assert defense_detail["attack_solves"] == 0
+    assert "first_defense" in client.get(
+        "/api/v1/users/me/profile", headers=player_headers
+    ).json()["achievement_slugs"]
     client.post(
         f"/api/v1/challenges/{challenge['id']}/submit",
         headers=player_headers,

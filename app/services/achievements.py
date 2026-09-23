@@ -30,6 +30,7 @@ def grant_achievement(
     user_id: str,
     achievement_slug: str,
     awarded_by: str | None = None,
+    awarded_at: str | None = None,
 ) -> bool:
     if achievement_slug == "core_member":
         connection.execute(
@@ -38,10 +39,29 @@ def grant_achievement(
         )
     cursor = connection.execute(
         "INSERT OR IGNORE INTO user_achievements "
-        "(user_id, achievement_slug, awarded_at, awarded_by) VALUES (?, ?, datetime('now'), ?)",
-        (user_id, achievement_slug, awarded_by),
+        "(user_id, achievement_slug, awarded_at, awarded_by) "
+        "VALUES (?, ?, COALESCE(?, datetime('now')), ?)",
+        (user_id, achievement_slug, awarded_at, awarded_by),
     )
     return cursor.rowcount > 0
+
+
+def sync_progress_achievements(connection: sqlite3.Connection, user_id: str) -> None:
+    """Grant solve milestones once, using the event time for existing records too."""
+    solves = connection.execute(
+        "SELECT MIN(created_at) AS created_at FROM submissions WHERE user_id = ? AND correct = 1 "
+        "AND awarded_points > 0 GROUP BY challenge_id ORDER BY created_at LIMIT 10",
+        (user_id,),
+    ).fetchall()
+    for threshold, slug in ((1, "first_solve"), (5, "five_solves"), (10, "ten_solves")):
+        if len(solves) >= threshold:
+            grant_achievement(connection, user_id, slug, awarded_at=solves[threshold - 1]["created_at"])
+    defense = connection.execute(
+        "SELECT created_at FROM defense_solves WHERE user_id = ? ORDER BY created_at, id LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if defense:
+        grant_achievement(connection, user_id, "first_defense", awarded_at=defense["created_at"])
 
 
 def maybe_grant_peak_geek_2025(connection: sqlite3.Connection, user_id: str) -> bool:

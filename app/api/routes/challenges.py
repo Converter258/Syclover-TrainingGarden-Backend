@@ -39,7 +39,7 @@ from app.services.assets import (
     safe_filename,
     store_bytes,
 )
-from app.services.achievements import maybe_grant_peak_geek_2025
+from app.services.achievements import maybe_grant_peak_geek_2025, sync_progress_achievements
 from app.services.build_log import IDLE_LIMIT_SECONDS, POLL_SECONDS, registry
 from app.services.docker import ContainerError
 from app.services.flags import (
@@ -293,6 +293,7 @@ async def submit_flag(
             ),
         )
         if correct:
+            sync_progress_achievements(connection, user["id"])
             maybe_grant_peak_geek_2025(connection, user["id"])
     if not correct:
         return SubmissionResult(correct=False, awarded_points=0, message="Flag is incorrect")
