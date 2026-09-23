@@ -184,6 +184,10 @@ ACHIEVEMENT_DEFINITIONS = (
     ("sprout_member", "新芽组成员", "学习、汲取、成长", "注册自动获取", "sprout"),
     ("core_member", "核心组成员", "热爱、坚持、成就", "管理员下发", "core"),
     ("peak_geek_2025", "Peak Geek 2025", "完成 2025 极客大挑战所有题目", "完成 2025 极客大挑战全部题目", "peak-geek"),
+    ("first_solve", "破土而出", "解开第一道题，训练旅程正式开始", "首次正确解题", "first-solve"),
+    ("five_solves", "渐入佳境", "累计解开 5 道不同题目", "累计解开 5 道题", "five-solves"),
+    ("ten_solves", "稳步生长", "累计解开 10 道不同题目", "累计解开 10 道题", "ten-solves"),
+    ("first_defense", "守护新芽", "首次成功部署修复并通过防御检查", "首次完成 AWDP 防御", "first-defense"),
 )
 
 
@@ -202,6 +206,7 @@ class Database:
         self._migrate_flags()
         self._seed_tags()
         self._seed_achievements()
+        self._backfill_progress_achievements()
 
     def _migrate_user_profile(self) -> None:
         """Add profile fields to databases created before Alpha0.0.5."""
@@ -242,6 +247,18 @@ class Database:
                 "AND EXISTS (SELECT 1 FROM user_achievements core WHERE core.user_id = user_achievements.user_id "
                 "AND core.achievement_slug = 'core_member')"
             )
+
+    def _backfill_progress_achievements(self) -> None:
+        """Award newly introduced milestones for solves recorded before this release."""
+        from app.services.achievements import sync_progress_achievements
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT user_id FROM submissions WHERE correct = 1 AND awarded_points > 0 "
+                "UNION SELECT user_id FROM defense_solves"
+            ).fetchall()
+            for row in rows:
+                sync_progress_achievements(connection, row["user_id"])
 
     def _migrate_achievement_catalog(self) -> None:
         with self.connect() as connection:

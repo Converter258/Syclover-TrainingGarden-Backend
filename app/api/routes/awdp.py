@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 
 from app.api.deps import AdminUser, CurrentUser, DatabaseDep, DockerDep, SettingsDep
 from app.schemas import AssetPublic, DeploymentEventPublic
-from app.services.achievements import maybe_grant_peak_geek_2025
+from app.services.achievements import maybe_grant_peak_geek_2025, sync_progress_achievements
 from app.services.assets import safe_filename, store_bytes, validate_asset
 from app.services.docker import ContainerError
 
@@ -238,6 +238,7 @@ async def deploy_defense_asset(
                 "(id, user_id, challenge_id, event_id, created_at) VALUES (?, ?, ?, ?, ?)",
                 (str(uuid.uuid4()), user["id"], instance["challenge_id"], event_id, created_at),
             )
+            sync_progress_achievements(connection, user["id"])
             maybe_grant_peak_geek_2025(connection, user["id"])
         row = connection.execute(
             "SELECT id, instance_id, asset_id, success, output, created_at FROM deployment_events WHERE id = ?",
