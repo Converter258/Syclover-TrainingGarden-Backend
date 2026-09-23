@@ -62,6 +62,36 @@ def sync_progress_achievements(connection: sqlite3.Connection, user_id: str) -> 
     ).fetchone()
     if defense:
         grant_achievement(connection, user_id, "first_defense", awarded_at=defense["created_at"])
+    first_try = connection.execute(
+        "SELECT s.created_at FROM submissions s WHERE s.user_id = ? AND s.correct = 1 "
+        "AND s.awarded_points > 0 AND NOT EXISTS ("
+        "SELECT 1 FROM submissions previous WHERE previous.user_id = s.user_id "
+        "AND previous.challenge_id = s.challenge_id AND previous.rowid < s.rowid) "
+        "ORDER BY s.created_at, s.rowid LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if first_try:
+        grant_achievement(connection, user_id, "first_try", awarded_at=first_try["created_at"])
+    comeback = connection.execute(
+        "SELECT s.created_at FROM submissions s WHERE s.user_id = ? AND s.correct = 1 "
+        "AND s.awarded_points > 0 AND ("
+        "SELECT COUNT(*) FROM submissions previous WHERE previous.user_id = s.user_id "
+        "AND previous.challenge_id = s.challenge_id AND previous.correct = 0 "
+        "AND previous.rowid < s.rowid) >= 3 "
+        "ORDER BY s.created_at, s.rowid LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    if comeback:
+        grant_achievement(connection, user_id, "comeback", awarded_at=comeback["created_at"])
+    categories = connection.execute(
+        "SELECT c.category, MIN(s.created_at) AS solved_at FROM submissions s "
+        "JOIN challenges c ON c.id = s.challenge_id WHERE s.user_id = ? "
+        "AND s.correct = 1 AND s.awarded_points > 0 GROUP BY c.category "
+        "ORDER BY solved_at LIMIT 3",
+        (user_id,),
+    ).fetchall()
+    if len(categories) == 3:
+        grant_achievement(connection, user_id, "versatile", awarded_at=categories[2]["solved_at"])
 
 
 def maybe_grant_peak_geek_2025(connection: sqlite3.Connection, user_id: str) -> bool:

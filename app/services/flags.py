@@ -3,8 +3,9 @@
 A challenge stores its flag as plaintext ``flag_template`` plus an HMAC digest of the
 literal flag. When the administrator enables the dynamic flag switch, the ``RAND``
 token inside the template is replaced with a fresh random string for every instance and
-injected into the container as the ``FLAG`` environment variable, so command-line
-archives that write ``$FLAG`` into their flag file keep working unchanged.
+injected into the container as the ``FLAG`` environment variable. The Docker launcher
+also creates conventional flag files when the image does not already provide them,
+so services can read the flag without an image-specific startup script.
 
 Rules that keep administrator intent intact:
 

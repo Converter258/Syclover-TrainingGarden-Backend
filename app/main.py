@@ -14,7 +14,7 @@ from app.core.seed import seed_database
 from app.services.docker import DockerService
 from app.services.reaper import run_reaper
 
-VERSION = "Alpha0.0.7"
+VERSION = "Alpha0.0.8"
 logger = logging.getLogger("syclover")
 
 

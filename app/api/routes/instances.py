@@ -16,6 +16,7 @@ from app.services.reaper import expire_instances
 router = APIRouter(prefix="/instances", tags=["instances"])
 logger = logging.getLogger("syclover.instances")
 MAX_ACTIVE_INSTANCES_PER_USER = 2
+INSTANCE_EXTENSION_MINUTES = 30
 
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0"}
 
@@ -82,7 +83,7 @@ def _launch_instance(instance_id: str, public_host: str, launch: dict, database,
         )
     if updated.rowcount == 0:
         # The user may stop the pending instance, or an administrator may delete its
-        # challenge, while ``docker run`` is still pulling/starting. Do not leave the
+        # challenge, while Docker is still pulling/starting. Do not leave the
         # late container alive without a database row for the next reaper pass to find.
         try:
             docker.stop(started.container_id)
@@ -182,18 +183,12 @@ async def list_instances(
     _resync_ports(user, database, docker, settings)
     public_host = _effective_public_host(request, settings)
     with database.connect() as connection:
-        if user["role"] in {"admin", "root_admin"}:
-            rows = connection.execute(
-                "SELECT i.*, c.title AS challenge_title FROM instances i "
-                "JOIN challenges c ON c.id = i.challenge_id ORDER BY i.created_at DESC"
-            ).fetchall()
-        else:
-            rows = connection.execute(
-                "SELECT i.*, c.title AS challenge_title FROM instances i "
-                "JOIN challenges c ON c.id = i.challenge_id WHERE i.user_id = ? "
-                "ORDER BY i.created_at DESC",
-                (user["id"],),
-            ).fetchall()
+        rows = connection.execute(
+            "SELECT i.*, c.title AS challenge_title FROM instances i "
+            "JOIN challenges c ON c.id = i.challenge_id WHERE i.user_id = ? "
+            "ORDER BY i.created_at DESC",
+            (user["id"],),
+        ).fetchall()
     return [_serialize(row, user, public_host) for row in rows]
 
 
@@ -342,6 +337,7 @@ async def get_instance(
     docker: DockerDep,
 ) -> InstancePublic:
     """Single instance status, used by the UI while a container is starting."""
+    _reclaim(database, docker)
     _reflect_dead_containers(user, database, docker)
     _resync_ports(user, database, docker, settings)
     with database.connect() as connection:
@@ -353,6 +349,46 @@ async def get_instance(
     if not row or (row["user_id"] != user["id"] and user["role"] not in {"admin", "root_admin"}):
         raise HTTPException(status_code=404, detail="Instance not found")
     return _serialize(row, user, _effective_public_host(request, settings))
+
+
+@router.post("/{instance_id}/extend", response_model=InstancePublic)
+async def extend_instance(
+    instance_id: str,
+    request: Request,
+    user: CurrentUser,
+    database: DatabaseDep,
+    settings: SettingsDep,
+    docker: DockerDep,
+) -> InstancePublic:
+    """Extend one live instance; an expiry claim and an extension cannot both win."""
+    _reclaim(database, docker)
+    now = datetime.now(UTC)
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT i.*, c.title AS challenge_title FROM instances i "
+            "JOIN challenges c ON c.id = i.challenge_id WHERE i.id = ?",
+            (instance_id,),
+        ).fetchone()
+        if not row or (row["user_id"] != user["id"] and user["role"] not in {"admin", "root_admin"}):
+            raise HTTPException(status_code=404, detail="Instance not found")
+        previous_expiry = datetime.fromisoformat(row["expires_at"])
+        if previous_expiry.tzinfo is None:
+            previous_expiry = previous_expiry.replace(tzinfo=UTC)
+        if row["status"] != "running" or previous_expiry <= now:
+            raise HTTPException(status_code=409, detail="Only a running, unexpired instance can be extended")
+        expires_at = previous_expiry + timedelta(minutes=INSTANCE_EXTENSION_MINUTES)
+        updated = connection.execute(
+            "UPDATE instances SET expires_at = ? WHERE id = ? AND status = 'running' AND expires_at = ?",
+            (expires_at.isoformat(), instance_id, row["expires_at"]),
+        )
+        if updated.rowcount != 1:
+            raise HTTPException(status_code=409, detail="Instance changed while extending; refresh and try again")
+        refreshed = connection.execute(
+            "SELECT i.*, c.title AS challenge_title FROM instances i "
+            "JOIN challenges c ON c.id = i.challenge_id WHERE i.id = ?",
+            (instance_id,),
+        ).fetchone()
+    return _serialize(refreshed, user, _effective_public_host(request, settings))
 
 
 @router.delete("/{instance_id}", response_model=Message)
