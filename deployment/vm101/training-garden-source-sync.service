@@ -1,0 +1,10 @@
+[Unit]
+Description=Mirror Training Garden fork and upstream branches on VPS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/training-garden-source-sync
+TimeoutStartSec=5min
+

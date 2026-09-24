@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh Training Garden source mirrors every 15 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=15min
+Persistent=true
+RandomizedDelaySec=1min
+Unit=training-garden-source-sync.service
+
+[Install]
+WantedBy=timers.target

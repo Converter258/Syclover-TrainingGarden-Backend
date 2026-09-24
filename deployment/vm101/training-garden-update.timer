@@ -1,0 +1,13 @@
+[Unit]
+Description=Check Training Garden source mirrors every 30 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitInactiveSec=30min
+Persistent=true
+RandomizedDelaySec=2min
+Unit=training-garden-update.service
+
+[Install]
+WantedBy=timers.target
+

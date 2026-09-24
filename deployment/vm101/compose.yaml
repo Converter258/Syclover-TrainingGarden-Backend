@@ -1,0 +1,49 @@
+services:
+  backend:
+    build: ./Syclover-TrainingGarden-Backend
+    restart: unless-stopped
+    environment:
+      SYCL_ENV: production
+      SYCL_SECRET_KEY: ${SYCL_SECRET_KEY:?Set SYCL_SECRET_KEY in .env}
+      SYCL_DATABASE_PATH: /app/data/training_garden.db
+      SYCL_STORAGE_PATH: /app/storage
+      SYCL_CORS_ORIGINS: https://${SITE_DOMAIN:?Set SITE_DOMAIN in .env}
+      SYCL_DOCKER_MODE: cli
+      SYCL_SEED_DEMO: "false"
+      SYCL_ADMIN_USERNAME: ${SYCL_ADMIN_USERNAME:-admin}
+      SYCL_ADMIN_PASSWORD: ${SYCL_ADMIN_PASSWORD:?Set SYCL_ADMIN_PASSWORD in .env}
+      SYCL_INSTANCE_BIND_ADDRESS: 0.0.0.0
+      SYCL_INSTANCE_PUBLIC_HOST: ${CHALLENGE_DOMAIN:-localhost}
+      SYCL_INSTANCE_PORT_RANGE_START: "30000"
+      SYCL_INSTANCE_PORT_RANGE_END: "30999"
+    volumes:
+      - backend_data:/app/data
+      - backend_storage:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  frontend:
+    build: ./Syclover-TrainingGarden-Frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - frontend
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN:?Set SITE_DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  backend_data:
+  backend_storage:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,18 @@
+services:
+  backend:
+    build:
+      context: ./Syclover-TrainingGarden-Backend
+      dockerfile: Dockerfile.vm101
+    environment:
+      SYCL_INSTANCE_PORT_RANGE_END: "30063"
+
+  frontend:
+    build:
+      context: ./Syclover-TrainingGarden-Frontend
+      dockerfile: Dockerfile.vm101
+    ports:
+      - "192.168.10.24:8080:80"
+
+  caddy:
+    profiles:
+      - vm101-unused-caddy
