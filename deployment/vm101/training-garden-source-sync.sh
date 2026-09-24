@@ -1,8 +1,9 @@
 #!/bin/sh
 set -eu
+umask 027
 
 root=/srv/training-garden/mirror
-install -d -m 0750 -o root -g tg-source "$root"
+mkdir -p "$root"
 
 for repo in Syclover-TrainingGarden-Backend Syclover-TrainingGarden-Frontend; do
     mirror="$root/$repo.git"
@@ -15,8 +16,6 @@ for repo in Syclover-TrainingGarden-Backend Syclover-TrainingGarden-Frontend; do
         +refs/heads/deploy/vm101:refs/heads/deploy-vm101
     git -C "$mirror" fetch --no-tags upstream \
         +refs/heads/main:refs/heads/upstream-main
-    chgrp -R tg-source "$mirror"
-    chmod -R g+rX,o-rwx "$mirror"
 done
 
 echo 'Training Garden source mirrors updated'
