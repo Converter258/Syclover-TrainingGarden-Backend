@@ -124,24 +124,31 @@ def update() -> None:
     for part in ("backend", "frontend"):
         old_tags[part] = f"training-garden-{part}:before-{stamp}"
         run("docker", "tag", image_id(f"training-garden-{part}-1"), old_tags[part])
-    compose(release, "build", "backend", "frontend", timeout=1800)
-    run("docker", "run", "--rm", "--network", "none", "--entrypoint", "python",
-        "training-garden-backend:latest", "-m", "compileall", "-q", "/app/app")
-
-    run("/usr/local/sbin/training-garden-backup", timeout=300)
-    backup = max((Path("/var/backups/training-garden/database")).glob("*.db"),
-                 key=lambda item: item.stat().st_mtime)
-    with tempfile.TemporaryDirectory(prefix="tg-migration-") as temporary:
-        db_copy = Path(temporary) / "training_garden.db"
-        shutil.copy2(backup, db_copy)
-        before = schema(db_copy)
+    try:
+        compose(release, "build", "backend", "frontend", timeout=1800)
         run("docker", "run", "--rm", "--network", "none", "--entrypoint", "python",
-            "-v", f"{temporary}:/tmp/tg", "training-garden-backend:latest", "-c",
-            'from pathlib import Path; from app.core.database import Database; Database(Path("/tmp/tg/training_garden.db")).initialize()')
-        after = schema(db_copy)
-        if before != after:
-            state("review_required", release=str(release), reason="database schema changes", backup=str(backup), **commits)
-            return
+            "training-garden-backend:latest", "-m", "compileall", "-q", "/app/app")
+
+        run("/usr/local/sbin/training-garden-backup", timeout=300)
+        backup = max((Path("/var/backups/training-garden/database")).glob("*.db"),
+                     key=lambda item: item.stat().st_mtime)
+        with tempfile.TemporaryDirectory(prefix="tg-migration-") as temporary:
+            db_copy = Path(temporary) / "training_garden.db"
+            shutil.copy2(backup, db_copy)
+            before = schema(db_copy)
+            run("docker", "run", "--rm", "--network", "none", "--entrypoint", "python",
+                "-v", f"{temporary}:/tmp/tg", "training-garden-backend:latest", "-c",
+                'from pathlib import Path; from app.core.database import Database; Database(Path("/tmp/tg/training_garden.db")).initialize()')
+            after = schema(db_copy)
+            if before != after:
+                for part in ("backend", "frontend"):
+                    run("docker", "tag", old_tags[part], f"training-garden-{part}:latest")
+                state("review_required", release=str(release), reason="database schema changes", backup=str(backup), **commits)
+                return
+    except Exception:
+        for part in ("backend", "frontend"):
+            run("docker", "tag", old_tags[part], f"training-garden-{part}:latest")
+        raise
 
     pending = BASE / ".current-updater-pending"
     pending.unlink(missing_ok=True)
