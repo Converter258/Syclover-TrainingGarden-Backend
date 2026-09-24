@@ -23,7 +23,7 @@ DATA = Path("/var/lib/training-garden/updater")
 ENV_FILE = ETC / "platform.env"
 SOURCE = "tg-source@47.109.46.12:/srv/training-garden/mirror"
 REPOS = ("Syclover-TrainingGarden-Backend", "Syclover-TrainingGarden-Frontend")
-SSH = "ssh -i /etc/training-garden/source_key -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10"
+SSH = "ssh -i /etc/training-garden/source_key -o UserKnownHostsFile=/etc/training-garden/source_known_hosts -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10"
 
 
 def run(*args: str, cwd: Path | None = None, capture: bool = False, timeout: int = 900) -> str:
