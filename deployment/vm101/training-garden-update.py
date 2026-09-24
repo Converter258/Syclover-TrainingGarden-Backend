@@ -10,6 +10,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ BASE = Path("/opt/training-garden")
 ETC = Path("/etc/training-garden")
 DATA = Path("/var/lib/training-garden/updater")
 ENV_FILE = ETC / "platform.env"
-SOURCE = "tg-source@47.109.46.12:/srv/training-garden/mirror"
+SOURCE = "tg-source@47.109.46.12:/srv/training-garden/delivery.git"
 REPOS = ("Syclover-TrainingGarden-Backend", "Syclover-TrainingGarden-Frontend")
 SSH = "ssh -i /etc/training-garden/source_key -o UserKnownHostsFile=/etc/training-garden/source_known_hosts -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10"
 
@@ -64,20 +65,56 @@ def schema(path: Path) -> list[tuple[str, str, str]]:
         ).fetchall()
 
 
+def unpack_snapshot(archive: Path, destination: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="tg-snapshot-") as temporary:
+        root = Path(temporary)
+        with tarfile.open(archive, "r:gz") as stream:
+            stream.extractall(root, filter="data")
+        children = list(root.iterdir())
+        if len(children) != 1 or not children[0].is_dir():
+            raise RuntimeError(f"unexpected source archive structure: {archive}")
+        shutil.copytree(children[0], destination)
+
+
+def apply_production_changes(base: Path, production: Path, upstream: Path) -> list[str]:
+    paths = {
+        item.relative_to(folder)
+        for folder in (base, production)
+        for item in folder.rglob("*") if item.is_file()
+    }
+    conflicts: list[str] = []
+    for relative in sorted(paths):
+        original = base / relative
+        customized = production / relative
+        latest = upstream / relative
+        before = original.read_bytes() if original.is_file() else None
+        wanted = customized.read_bytes() if customized.is_file() else None
+        actual = latest.read_bytes() if latest.is_file() else None
+        if before == wanted or actual == wanted:
+            continue
+        if actual != before:
+            conflicts.append(str(relative))
+            continue
+        if wanted is None:
+            latest.unlink()
+        else:
+            latest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(customized, latest)
+    return conflicts
+
+
 def update() -> None:
     current = (BASE / "current").resolve(strict=True)
-    commits: dict[str, str] = {}
-    for repo in REPOS:
-        mirror = DATA / f"{repo}.git"
-        remote = f"{SOURCE}/{repo}.git"
-        if not mirror.exists():
-            run("git", "clone", "--mirror", remote, str(mirror), timeout=120)
-        else:
-            run("git", "-C", str(mirror), "remote", "update", "--prune", timeout=120)
-        for branch in ("upstream-main", "deploy-vm101"):
-            commits[f"{repo}/{branch}"] = run(
-                "git", "-C", str(mirror), "rev-parse", f"refs/heads/{branch}", capture=True
-            )
+    delivery = DATA / "delivery"
+    if not delivery.exists():
+        run("git", "clone", "--quiet", SOURCE, str(delivery), timeout=120)
+    else:
+        run("git", "pull", "--ff-only", "--quiet", cwd=delivery, timeout=120)
+    sources = json.loads((delivery / "manifest.json").read_text())
+    commits = {
+        f"{repo}/{branch}": sources[repo][branch]
+        for repo in REPOS for branch in ("upstream-main", "deploy-vm101")
+    }
 
     current_manifest = (current / "RELEASE_MANIFEST.txt")
     if current_manifest.exists():
@@ -102,14 +139,17 @@ def update() -> None:
     release.mkdir(parents=True, exist_ok=False)
     for repo in REPOS:
         dest = release / repo
-        run("git", "clone", "--quiet", "--branch", "deploy-vm101", str(DATA / f"{repo}.git"), str(dest))
-        run("git", "config", "user.name", "Training Garden deployment", cwd=dest)
-        run("git", "config", "user.email", "deploy@localhost", cwd=dest)
-        try:
-            run("git", "merge", "--no-ff", "--no-edit", "origin/upstream-main", cwd=dest, timeout=120)
-        except subprocess.CalledProcessError:
-            state("review_required", release=str(release), reason=f"merge conflict in {repo}", **commits)
-            return
+        with tempfile.TemporaryDirectory(prefix="tg-overlay-") as temporary:
+            base = Path(temporary) / "base"
+            production = Path(temporary) / "production"
+            folder = delivery / repo
+            unpack_snapshot(folder / "base.tar.gz", base)
+            unpack_snapshot(folder / "deploy-vm101.tar.gz", production)
+            unpack_snapshot(folder / "upstream-main.tar.gz", dest)
+            conflicts = apply_production_changes(base, production, dest)
+            if conflicts:
+                state("review_required", release=str(release), reason=f"upstream changed production files in {repo}: {', '.join(conflicts)}", **commits)
+                return
     deployment = release / REPOS[0] / "deployment" / "vm101"
     for filename in ("compose.yaml", "compose.vm101.yaml", "Caddyfile"):
         shutil.copy2(deployment / filename, release / filename)
