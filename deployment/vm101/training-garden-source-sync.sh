@@ -5,6 +5,17 @@ umask 027
 root=/srv/training-garden/mirror
 mkdir -p "$root"
 
+fetch_retry() {
+    attempt=0
+    until timeout 20 git -C "$1" fetch --no-tags "$2" "$3"; do
+        attempt=$((attempt + 1))
+        if [ "$attempt" -ge 3 ]; then
+            return 1
+        fi
+        sleep 5
+    done
+}
+
 for repo in Syclover-TrainingGarden-Backend Syclover-TrainingGarden-Frontend; do
     mirror="$root/$repo.git"
     if [ ! -d "$mirror" ]; then
@@ -12,9 +23,9 @@ for repo in Syclover-TrainingGarden-Backend Syclover-TrainingGarden-Frontend; do
         git -C "$mirror" remote add fork "https://github.com/Converter258/$repo.git"
         git -C "$mirror" remote add upstream "https://github.com/K4per/$repo.git"
     fi
-    git -C "$mirror" fetch --no-tags fork \
+    fetch_retry "$mirror" fork \
         +refs/heads/deploy/vm101:refs/heads/deploy-vm101
-    git -C "$mirror" fetch --no-tags upstream \
+    fetch_retry "$mirror" upstream \
         +refs/heads/main:refs/heads/upstream-main
 done
 

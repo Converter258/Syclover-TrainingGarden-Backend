@@ -8,4 +8,4 @@ Type=oneshot
 User=tg-source
 Group=tg-source
 ExecStart=/usr/local/sbin/training-garden-source-sync
-TimeoutStartSec=5min
+TimeoutStartSec=8min
