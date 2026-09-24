@@ -165,7 +165,15 @@ def update() -> None:
         old_tags[part] = f"training-garden-{part}:before-{stamp}"
         run("docker", "tag", image_id(f"training-garden-{part}-1"), old_tags[part])
     try:
-        compose(release, "build", "backend", "frontend", timeout=1800)
+        for attempt in range(3):
+            try:
+                compose(release, "build", "backend", "frontend", timeout=1800)
+                break
+            except subprocess.CalledProcessError:
+                if attempt == 2:
+                    raise
+                print(f"Image build failed; retrying ({attempt + 1}/3)", flush=True)
+                time.sleep(15)
         run("docker", "run", "--rm", "--network", "none", "--entrypoint", "python",
             "training-garden-backend:latest", "-m", "compileall", "-q", "/app/app")
 
@@ -188,6 +196,7 @@ def update() -> None:
     except Exception:
         for part in ("backend", "frontend"):
             run("docker", "tag", old_tags[part], f"training-garden-{part}:latest")
+        shutil.rmtree(release)
         raise
 
     pending = BASE / ".current-updater-pending"
